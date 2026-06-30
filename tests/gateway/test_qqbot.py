@@ -5,6 +5,7 @@ import os
 from types import SimpleNamespace
 from unittest import mock
 
+import aiohttp
 import pytest
 
 from gateway.config import PlatformConfig
@@ -2220,3 +2221,59 @@ class TestReadEventsClosedWsGuard:
         adapter._ws = None
         with pytest.raises(RuntimeError):
             asyncio.run(adapter._read_events())
+
+    def test_read_events_returns_when_running_false(self):
+        """A deliberate shutdown (self._running toggled to False) must NOT
+        raise — the post-loop guard only fires when we still intend to run.
+        """
+        adapter = self._make_adapter()
+        adapter._running = False
+        adapter._ws = SimpleNamespace(closed=False, receive=mock.AsyncMock())
+        # No exception expected — clean return
+        asyncio.run(adapter._read_events())
+
+    def test_read_events_raises_on_silent_loop_exit(self):
+        """Regression (#55492): if the while-loop exits without an error
+        frame while we still intend to be running (e.g. ws.closed flipped
+        between condition check and receive), _read_events must raise so
+        _listen_loop does not reset ``backoff_idx = 0`` erroneously.
+        """
+        adapter = self._make_adapter()
+        adapter._running = True
+
+        # Simulate a ws that is "not closed" at condition-check time but
+        # whose receive() returns a frame with a non-error, non-text type
+        # we don't explicitly handle — the loop falls through without
+        # raising, mirroring a real silent-exit scenario.
+        sentinel_msg = SimpleNamespace(
+            type=aiohttp.WSMsgType.PING  # handled (pass), next iter sees closed
+        )
+        receive = mock.AsyncMock(side_effect=[sentinel_msg])
+        adapter._ws = SimpleNamespace(closed=False, receive=receive)
+
+        # Make the second condition-check see ws closed by flipping state
+        # between iterations (and return no further frames).
+        async def flip_closed_after_first_receive():
+            # First call returns PING (handled), second is irrelevant.
+            return sentinel_msg
+
+        original_running = adapter._running
+        call_state = {"calls": 0}
+
+        async def receive_then_close(_self=None):
+            call_state["calls"] += 1
+            if call_state["calls"] == 1:
+                return sentinel_msg
+            # Mark closed so loop exits after this iteration's receive
+            # returns; if we just return the same msg the loop enters
+            # again. We instead raise StopAsyncIteration after marking
+            # ws.closed so the next while-condition check is False.
+            adapter._ws.closed = True
+            return sentinel_msg
+
+        receive.side_effect = receive_then_close
+        adapter._ws.receive = receive
+
+        with pytest.raises(RuntimeError, match="QQ WebSocket closed"):
+            asyncio.run(adapter._read_events())
+        assert original_running is True
