@@ -277,6 +277,105 @@ class TestChatCompletionsBuildKwargs:
         )
         assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "medium"}
 
+    def test_reasoning_extra_body_honors_configured_effort(self, transport):
+        """#57601 — extra_body.reasoning fallback must respect the user's
+        configured effort instead of unconditionally sending ``"medium"``
+        even when the user explicitly asked for ``"high"`` / ``"max"``.
+
+        Pin the new behaviour: a model that goes through the
+        ``extra_body.reasoning`` path with ``reasoning_config={"effort": "high"}``
+        gets the configured effort, not the legacy default.
+        """
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5-thinking",
+            messages=msgs,
+            supports_reasoning=True,
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "high"}
+
+        kw_max = transport.build_kwargs(
+            model="gpt-5-thinking",
+            messages=msgs,
+            supports_reasoning=True,
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert kw_max["extra_body"]["reasoning"] == {"enabled": True, "effort": "max"}
+
+        # Unknown / unrecognised effort still falls back to "medium" so we
+        # never silently pass arbitrary strings upstream.
+        kw_garbage = transport.build_kwargs(
+            model="gpt-5-thinking",
+            messages=msgs,
+            supports_reasoning=True,
+            reasoning_config={"enabled": True, "effort": "ultra-mega"},
+        )
+        assert kw_garbage["extra_body"]["reasoning"] == {"enabled": True, "effort": "medium"}
+
+    def test_custom_provider_emits_top_level_reasoning_effort(self, transport):
+        """#57601 — custom (named user-defined) OpenAI-compatible endpoint must
+        surface ``reasoning_effort`` at the top level of api_kwargs so the
+        upstream actually receives it.
+
+        Tested via the public ``provider_profile=get_provider_profile("custom")``
+        path (the same one shifted to ``is_custom_provider=True`` in build_kwargs),
+        with ``supports_reasoning=True`` so the new branch matches.
+        """
+        from providers import get_provider_profile
+        profile = get_provider_profile("custom")
+
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="glm-5.2",
+            messages=msgs,
+            provider_profile=profile,
+            supports_reasoning=True,
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert kw.get("reasoning_effort") == "max", (
+            "custom provider dropped top-level reasoning_effort — upstream "
+            "(e.g. GLM-5.2 on Volcengine ARK) falls back to its default effort. "
+            f"got kwargs={kw!r}"
+        )
+        # And it should NOT also emit a parallel extra_body.reasoning entry
+        # for the same call (avoids double-emit where the upstream only
+        # expects one of the two shapes).
+        assert "reasoning" not in kw.get("extra_body", {}), (
+            "custom provider emitted both top-level reasoning_effort AND "
+            f"extra_body.reasoning — bad shape. got kwargs={kw!r}"
+        )
+
+    def test_custom_provider_disabled_thinking_omits_reasoning_effort(self, transport):
+        """custom provider + reasoning disabled → no top-level key emitted at all."""
+        from providers import get_provider_profile
+        profile = get_provider_profile("custom")
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="some-model",
+            messages=msgs,
+            provider_profile=profile,
+            supports_reasoning=True,
+            reasoning_config={"enabled": False},
+        )
+        assert "reasoning_effort" not in kw
+
+    def test_custom_provider_without_supports_reasoning_skips_branch(self, transport):
+        """Regression guard — the new branch must be gated on
+        supports_reasoning. A custom-provider model that doesn't advertise
+        reasoning shouldn't see the parameter."""
+        from providers import get_provider_profile
+        profile = get_provider_profile("custom")
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="some-non-reasoning-model",
+            messages=msgs,
+            provider_profile=profile,
+            supports_reasoning=False,
+            reasoning_config={"enabled": True, "effort": "max"},
+        )
+        assert "reasoning_effort" not in kw
+
     def test_nous_omits_disabled_reasoning(self, transport):
         from providers import get_provider_profile
         profile = get_provider_profile("nous")

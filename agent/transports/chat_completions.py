@@ -17,6 +17,7 @@ from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+from hermes_constants import VALID_REASONING_EFFORTS
 
 
 def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
@@ -377,6 +378,27 @@ class ChatCompletionsTransport(ProviderTransport):
             if _lm_effort is not None:
                 api_kwargs["reasoning_effort"] = _lm_effort
 
+        # Custom (named user-defined) endpoint on top of any OpenAI-compatible
+        # transport: emit top-level ``reasoning_effort`` so the user's
+        # configured effort actually reaches upstream — previously only Kimi,
+        # TokenHub, and LM Studio had dedicated branches, and every other
+        # custom provider silently dropped the user's ``reasoning.effort``
+        # value (issue #57601, e.g. GLM-5.2 on Volcengine ARK getting the
+        # API default instead of the explicit ``max`` / ``high``).
+        if params.get("is_custom_provider", False) and params.get("supports_reasoning", False):
+            _custom_thinking_off = bool(
+                reasoning_config
+                and isinstance(reasoning_config, dict)
+                and reasoning_config.get("enabled") is False
+            )
+            if not _custom_thinking_off:
+                _custom_effort = "medium"
+                if reasoning_config and isinstance(reasoning_config, dict):
+                    _e = (reasoning_config.get("effort") or "").strip().lower()
+                    if _e in VALID_REASONING_EFFORTS:
+                        _custom_effort = _e
+                api_kwargs["reasoning_effort"] = _custom_effort
+
         # extra_body assembly
         extra_body: dict[str, Any] = {}
 
@@ -423,7 +445,17 @@ class ChatCompletionsTransport(ProviderTransport):
                 if gh_reasoning is not None:
                     extra_body["reasoning"] = gh_reasoning
             else:
-                extra_body["reasoning"] = {"enabled": True, "effort": "medium"}
+                # Honor the user's configured effort instead of unconditionally
+                # sending ``"medium"`` — issue #57601 reports that some users
+                # (e.g. GLM-5.2 on Volcengine ARK behind OpenRouter-style
+                # extra_body) saw their explicit ``reasoning_effort: high``
+                # / ``max`` silently downgraded to "medium" by this branch.
+                _fallback_effort = "medium"
+                if reasoning_config and isinstance(reasoning_config, dict):
+                    _e = (reasoning_config.get("effort") or "").strip().lower()
+                    if _e in VALID_REASONING_EFFORTS:
+                        _fallback_effort = _e
+                extra_body["reasoning"] = {"enabled": True, "effort": _fallback_effort}
 
         if provider_name == "gemini":
             raw_thinking_config = _build_gemini_thinking_config(model, reasoning_config)
@@ -535,6 +567,29 @@ class ChatCompletionsTransport(ProviderTransport):
             )
         )
         api_kwargs.update(top_level_from_profile)
+
+        # Custom-profile path (named user-defined OpenAI-compatible endpoint):
+        # if the profile didn't emit a top-level reasoning_effort and the model
+        # advertises reasoning, emit the user's configured effort verbatim so it
+        # actually reaches upstream. Previously every non-Kimi/non-TokenHub/
+        # non-LM-Studio profile silently dropped ``reasoning.effort`` — fix for
+        # #57601 (GLM-5.2 on Volcengine ARK, etc.).
+        if (
+            "reasoning_effort" not in api_kwargs
+            and params.get("supports_reasoning", False)
+        ):
+            _custom_thinking_off = bool(
+                reasoning_config
+                and isinstance(reasoning_config, dict)
+                and reasoning_config.get("enabled") is False
+            )
+            if not _custom_thinking_off:
+                _custom_effort = "medium"
+                if reasoning_config and isinstance(reasoning_config, dict):
+                    _e = (reasoning_config.get("effort") or "").strip().lower()
+                    if _e in VALID_REASONING_EFFORTS:
+                        _custom_effort = _e
+                api_kwargs["reasoning_effort"] = _custom_effort
 
         # extra_body assembly
         extra_body: dict[str, Any] = {}

@@ -791,13 +791,20 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
         env["HOME"] = home
 
 
-VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 
 
 def parse_reasoning_effort(effort) -> dict | None:
     """Parse a reasoning effort level into a config dict.
 
-    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh".
+    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh", "max".
+    ``max`` is a recognised top tier (GLM-5.2's deep-reasoning default, and the
+    target of Claude Code's ``xhigh``/``max``/``ultracode`` effort mapping), so
+    it must round-trip through ``parse_reasoning_effort`` to reach upstream
+    APIs. Without it, a user-configured ``reasoning_effort: max`` was silently
+    dropped at request build time and the model fell back to its own default
+    effort — which for GLM-5.2 meant slower output and for other models meant
+    undefined behaviour. Closes #57601.
     Returns None when the input is empty or unrecognized (caller uses default).
     Returns {"enabled": False} for "none" (aliases: "false", "disabled", and
     YAML boolean False — users write ``reasoning_effort: false``/``off``/``no``
