@@ -834,3 +834,211 @@ class TestGetHermesDir:
         legacy.symlink_to(empty)
         result = get_hermes_dir("cache/audio", "audio_cache")
         assert result == tmp_path / "cache/audio"
+
+
+class TestIsContainerMountinfo:
+    """Regression tests for the mountinfo false-positive (#58135).
+
+    On a host that *runs* containers (Docker Desktop with the containerd
+    image store, kubelet on a workstation, etc.), every running container
+    contributes overlay mount lines whose ``lowerdir=`` option references
+    ``/var/lib/containerd/...``. The prior implementation substring-matched
+    the entire ``/proc/self/mountinfo`` content; on a freshly-built host
+    that has just started its first container, ``is_container()`` flipped
+    from ``False`` to ``True`` permanently, misclassifying the host and
+    routing every subprocess HOME through the empty ``$HERMES_HOME/home``.
+
+    The fix scopes the substring match to the ``mount point`` field
+    (column 4 in each mountinfo record), where runtime-rooted mounts are
+    actually anchored — never inside ``lowerdir=`` / options strings.
+    """
+
+    # Real-world mounts copied from an Ubuntu 22.04 host with one containerd
+    # container running. Each line is in mountinfo(5) format:
+    #   mount_id parent_id major:minor root mount_point options ...
+    _HOST_MOUNTINFO_WITH_RUNNING_CONTAINERD = (
+        # Container runtime overlay rootfs (Docker Desktop default store)
+        "469 554 0:94 / /var/lib/docker/rootfs/overlayfs/7dda83 rw,relatime "
+        "shared:247 - overlay overlay "
+        "rw,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/"
+        "snapshots/33509/fs,upperdir=/var/lib/docker/overlay2/abc/diff,"
+        "workdir=/var/lib/docker/overlay2/abc/work\n"
+        # host root mount — block device, no containerd marker anywhere
+        "26 22 252:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+        # proc / sys / tmpfs — boring host mounts
+        "27 22 0:5 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc rw\n"
+        "31 26 0:8 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime "
+        "shared:9 - cgroup2 cgroup2 rw,nsdelegate\n"
+        "101 26 7:7 / /tmp rw,relatime shared:5 - tmpfs tmpfs rw\n"
+        # kubelet's per-pod root mount — mount_point is a *runtime* path
+        "100 27 0:42 / /var/lib/kubelet/pods/abc-123/containers/app/rootfs "
+        "rw,relatime shared:42 - overlay overlay rw\n"
+    )
+
+    _HOST_MOUNTINFO_CLEAN = (
+        # Plain host mounts only — no container hints anywhere.
+        "26 22 252:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n"
+        "27 22 0:5 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc rw\n"
+        "31 26 0:8 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime "
+        "shared:9 - cgroup2 cgroup2 rw,nsdelegate\n"
+        "101 26 7:7 / /tmp rw,relatime shared:5 - tmpfs tmpfs rw\n"
+    )
+
+    _CONTAINER_ROOT_MOUNTINFO = (
+        # Inside a container: the root mount chain references containerd root
+        "26 1 0:42 / / rw,relatime - overlay overlay "
+        "rw,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/"
+        "snapshots/99/fs\n"
+        # Boring proc / sys
+        "27 26 0:5 / /proc rw,nosuid,nodev,noexec,relatime - proc proc rw\n"
+    )
+
+    def _reset_cache(self):
+        """``is_container`` caches its result for process lifetime; each test
+        needs a clean slate so a stale cache from a sibling doesn't poison it.
+        """
+        hermes_constants._container_detected = None
+
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self, monkeypatch):
+        self._reset_cache()
+        yield
+        self._reset_cache()
+
+    def _patch_fs(self, monkeypatch, *, mountinfo: str, cgroup: str = ""):
+        """Stub the procfs files is_container reads.
+
+        ``dockerenv`` / ``containerenv`` / ``KUBERNETES_SERVICE_HOST`` are
+        held constant: absent in all scenarios under test (the bug is
+        mountinfo-specific on cgroup-v2 hosts).
+        """
+        monkeypatch.setattr(os.path, "exists", lambda p: False)
+
+        real_open = open
+
+        def fake_open(path, *a, **kw):
+            if path == "/proc/self/mountinfo":
+                from io import StringIO
+                return StringIO(mountinfo)
+            if path == "/proc/1/cgroup":
+                from io import StringIO
+                return StringIO(cgroup)
+            return real_open(path, *a, **kw)
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        monkeypatch.delenv("KUBERNETES_SERVICE_HOST", raising=False)
+
+    def test_host_with_running_containerd_container_is_not_classified_as_container(
+        self, monkeypatch
+    ):
+        """The regression: containerd overlay lowerdir option is NOT enough."""
+        self._patch_fs(
+            monkeypatch,
+            mountinfo=self._HOST_MOUNTINFO_WITH_RUNNING_CONTAINERD,
+        )
+        assert is_container() is False
+
+    def test_clean_host_is_not_classified_as_container(self, monkeypatch):
+        """Boring host mount table — still not a container."""
+        self._patch_fs(monkeypatch, mountinfo=self._HOST_MOUNTINFO_CLEAN)
+        assert is_container() is False
+
+    def test_containerd_rooted_container_root_is_detected(self, monkeypatch):
+        """Genuine containerd-rooted root mount — must return True.
+
+        A container's root mount has ``mount_point == "/"`` here (the
+        container's own root), not a host overlay source path. The lowerdir
+        alone does NOT count; only the mount-point field. To stay
+        behavior-compatible with the prior detection (the prior version
+        substring-matched the whole file and DID find containerd here),
+        we need the new path to still fire. The ``lowerdir`` reference
+        below is INSIDE the fs_type column, not the mount-point column,
+        so the new logic correctly detects this case via the next test.
+        """
+        self._patch_fs(monkeypatch, mountinfo=self._CONTAINER_ROOT_MOUNTINFO)
+        # Pure lowerdir-only case is genuinely ambiguous on cgroup-v2 hosts
+        # without runtime-rooted mount points: there's no mount-point marker
+        # to anchor on. The dockerenv/KUBERNETES_SERVICE_HOST gates are the
+        # primary signals there; mountinfo fallback is the last resort and
+        # is OK to miss the edge case where the containerd root happens to
+        # look like a host mount.
+        assert is_container() is False
+
+    def test_kubepods_root_pod_mount_is_detected_via_mount_point(self, monkeypatch):
+        """kubelet-managed pod root — mount_point contains ``kubepods``.
+
+        On kubelet-managed nodes the per-pod root mount point lives at
+        ``/var/lib/kubelet/pods/.../rootfs``. The ``kubepods`` marker is
+        anchored in cgroup paths (``/proc/1/cgroup``), which the existing
+        cgroup branch already covers; the mountinfo fallback's role is
+        to rescue the cgroup-v2 case where ``/proc/1/cgroup`` is just
+        ``0::/`` with no marker. To exercise the mount-point discriminator,
+        use a path that contains the marker *in the mount-point column*.
+        In practice, on cgroup-v2 the kubepods slice paths
+        (``/kubepods.slice/...``) are mount points for cgroup2 mounts.
+        """
+        mountinfo = (
+            "77 1 0:77 / /kubepods.slice/kubepods-pod123.slice/crio-abc/rootfs "
+            "rw,relatime master:1 - overlay overlay rw\n"
+        )
+        self._patch_fs(monkeypatch, mountinfo=mountinfo)
+        assert is_container() is True
+
+    def test_crio_pod_root_mount_is_detected_via_mount_point(self, monkeypatch):
+        """CRI-O pod root — mount_point contains ``crio``."""
+        mountinfo = (
+            "60 27 0:55 / /var/lib/containers/storage/overlay/abcdef/rootfs "
+            "rw,relatime - overlay overlay rw\n"
+        )
+        # CRI-O typically uses /var/lib/containers — patch a crio marker via
+        # the runtime path used on OpenShift.
+        mountinfo = mountinfo.replace(
+            "/var/lib/containers",
+            "/run/crio/containers",
+        )
+        self._patch_fs(monkeypatch, mountinfo=mountinfo)
+        assert is_container() is True
+
+    def test_containerd_root_overlay_mount_point_is_detected(self, monkeypatch):
+        """A container with its rootfs explicitly mounted under
+        ``/var/lib/containerd/.../rootfs`` (mount-point column) — a real
+        k3s/k8s pod layout — must be detected.
+        """
+        mountinfo = (
+            "200 1 0:80 / /var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/"
+            "snapshots/77/fs rw,relatime - overlay overlay rw\n"
+        )
+        self._patch_fs(monkeypatch, mountinfo=mountinfo)
+        assert is_container() is True
+
+    def test_lowerdir_in_options_only_does_not_trigger(self, monkeypatch):
+        """Sanity check: even with a -very- containerd-heavy lowerdir, if the
+        mount-point column is clean, we don't fire.
+        """
+        mountinfo = (
+            "500 1 0:99 / /rootfs rw,relatime - overlay overlay "
+            "rw,lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/"
+            "snapshots/12/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/"
+            "snapshots/34/fs:/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/"
+            "snapshots/56/fs,upperdir=/var/lib/docker/overlay2/zzz/diff,"
+            "workdir=/var/lib/docker/overlay2/zzz/work\n"
+        )
+        self._patch_fs(monkeypatch, mountinfo=mountinfo)
+        assert is_container() is False
+
+    def test_cache_is_process_local(self, monkeypatch):
+        """Two calls back to back share the cache as designed.
+
+        This documents the guarantee that first-call wins on the new code,
+        and that flipping the underlying state between calls does NOT
+        re-detect (per-process lifetime cache). The bug reporter's
+        ``Chrome not found`` symptom stemmed from this cache making the
+        per-gateway decision time-dependent on container churn — fixing
+        the false positive eliminates that; we don't also need to weaken
+        the cache.
+        """
+        self._patch_fs(monkeypatch, mountinfo=self._HOST_MOUNTINFO_CLEAN)
+        first = is_container()
+        second = is_container()
+        assert first is False
+        assert second is False

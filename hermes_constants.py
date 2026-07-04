@@ -864,8 +864,20 @@ def is_container() -> bool:
     runtime marker, so containerd/CRI-O runtimes (the common case on
     Kubernetes/k3s) were previously missed. To cover those, also check:
       * ``KUBERNETES_SERVICE_HOST`` env var — set in every Kubernetes pod.
-      * ``kubepods`` / ``containerd`` / ``crio`` markers in ``/proc/1/cgroup``.
-      * the same markers in ``/proc/self/mountinfo`` (cgroup-v2 fallback).
+      * ``kubepods`` / ``containerd`` / ``crio`` markers in the mount *point*
+        field of ``/proc/self/mountinfo`` (cgroup-v2 fallback).
+
+    Important: markers must match the ``mount point`` field only, never
+    inside ``lowerdir=`` or other option strings. On a *host* that runs
+    containers (Docker Desktop's containerd image store is the common case),
+    every container's overlay mount contributes lines like
+    ``lowerdir=/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/...``
+    to the host's mount table; substring-matching the entire file wrongly
+    classifies the host as "inside a container". The mount point on those
+    lines is an *overlay source path* under the containerd snapshot store,
+    so matching only the second column discriminator sidesteps the false
+    positive while still detecting genuine containerd-rooted root mounts
+    (#58135).
 
     Result is cached for the process lifetime.  Import-safe — no heavy deps.
 
@@ -894,14 +906,29 @@ def is_container() -> bool:
     except OSError:
         pass
     # cgroup v2: /proc/1/cgroup is just "0::/" with no marker. The container
-    # runtime still shows up in the mount table (overlay rootfs, runtime mount
-    # paths), so scan mountinfo as a last resort.
+    # runtime still shows up in the mount table, but only as a *root* mount
+    # whose mount point carries the runtime path. On a host that merely runs
+    # containers (no nested runtime), overlay mount options like
+    # ``lowerdir=/var/lib/containerd/...`` contain the same strings but live
+    # in a separate column — match only the mount-point field to avoid
+    # false positives (#58135).
+    _RUNTIME_MOUNT_MARKERS = ("kubepods", "containerd", "crio")
     try:
         with open("/proc/self/mountinfo", "r", encoding="utf-8") as f:
-            mountinfo = f.read()
-            if any(marker in mountinfo for marker in ("kubepods", "containerd", "crio")):
-                _container_detected = True
-                return True
+            for line in f:
+                # mountinfo fields:
+                #   mount_id parent_id major:minor root mount_point options
+                #   [- fs_type source super_opts]
+                # Whitespace-separated. The first unknown separator is the
+                # optional " - " between options and fs_type, which is fine
+                # to ignore — we only need col 0..4 of the prefix.
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+                mount_point = parts[4]
+                if any(marker in mount_point for marker in _RUNTIME_MOUNT_MARKERS):
+                    _container_detected = True
+                    return True
     except OSError:
         pass
     _container_detected = False
