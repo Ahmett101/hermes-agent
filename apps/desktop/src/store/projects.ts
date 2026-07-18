@@ -257,7 +257,7 @@ export async function refreshProjectTree(): Promise<void> {
   $projectTreeLoading.set(true)
 
   try {
-    const res = await gatewayRequest<ProjectTreePayload>('projects.tree', { preview_limit: 3 })
+    const res = await gatewayRequest<ProjectTreePayload>('projects.tree', { preview_limit: 3, profile: $activeProfile.get() })
     // The flat Sessions list shows everything; scoped ids are only used here to
     // reconcile the optimistic eviction layer against what the server still lists.
     const scoped = new Set(res.scoped_session_ids ?? [])
@@ -293,7 +293,8 @@ export async function refreshProjectTree(): Promise<void> {
 export async function fetchProjectSessions(projectId: string): Promise<SidebarProjectTree | null> {
   try {
     const res = await gatewayRequest<{ project: SidebarProjectTree | null }>('projects.project_sessions', {
-      project_id: projectId
+      project_id: projectId,
+      profile: $activeProfile.get(),
     })
 
     return res.project ?? null

@@ -1040,6 +1040,28 @@ def _profile_scoped(handler):
     return wrapper
 
 
+def _project_tree_db(params: dict | None) -> object:
+    """Return the SessionDB for a ``projects.tree`` / ``projects.project_sessions``
+    call, scoped to ``params['profile']`` when supplied.
+
+    The desktop sidebar switches profiles by sending ``?profile=<name>`` on these
+    RPCs. Without this, both handlers fell back to ``_get_db()`` (the launch
+    profile's state.db), so a sub-profile's sessions never surfaced in the
+    sidebar — only the default profile's history showed. Mirror the profile-aware
+    DB open used by the session RPCs (#64987).
+    """
+    if isinstance(params, dict):
+        home = _profile_home(params.get("profile"))
+        if home is not None:
+            from hermes_state import SessionDB
+
+            try:
+                return SessionDB(db_path=Path(home) / "state.db")
+            except Exception:
+                logger.debug("failed to open profile db for project tree", exc_info=True)
+    return _get_db()
+
+
 # Placeholder ``terminal.cwd`` values that don't name a real directory — the
 # gateway resolves these to the home dir at runtime, so they must NOT be treated
 # as an explicit workspace (mirrors gateway/run.py's config bridge).
@@ -5350,7 +5372,7 @@ def _(rid, params: dict) -> dict:
 
 @method("session.list")
 def _(rid, params: dict) -> dict:
-    db = _get_db()
+    db = _project_tree_db(params)
     if db is None:
         return _db_unavailable_error(rid, code=5006)
     try:
@@ -11243,7 +11265,7 @@ def _(rid, params: dict) -> dict:
     Lanes carry no session rows here; drill-in uses ``projects.project_sessions``.
     """
     try:
-        db = _get_db()
+        db = _project_tree_db(params)
         if db is None:
             return _ok(rid, {"projects": [], "active_id": None, "scoped_session_ids": []})
 
@@ -11272,7 +11294,7 @@ def _(rid, params: dict) -> dict:
         if not project_id:
             return _err(rid, 5063, "project_id required")
 
-        db = _get_db()
+        db = _project_tree_db(params)
         if db is None:
             return _ok(rid, {"project": None})
 
