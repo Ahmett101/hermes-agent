@@ -8345,6 +8345,36 @@ def _resolve_node_runtime_npm() -> str | None:
     return None
 
 
+def _missing_root_deps(root: Path) -> list[str]:
+    """Return declared root dependencies absent from ``node_modules``.
+
+    Used as a silent-failure guard after a 0-exit ``npm ci``: ``npm
+    ci`` wipes ``node_modules`` before reifying, and a combined
+    root+workspace pass can finish with exit 0 while a declared root
+    dependency (e.g. ``agent-browser``, ``@streamdown/math``) never
+    materialized on disk — the exact #64354 violation that left browser
+    tools silently broken. A dep counts as present when its
+    ``node_modules/<name>/package.json`` exists (hoisted or legacy
+    flat layout); an empty directory with no manifest counts as missing.
+    """
+    manifest = root / "package.json"
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception:
+        # Unreadable manifest: cannot verify, don't crash the update.
+        return []
+    deps = data.get("dependencies") or {}
+    if not deps:
+        return []
+    node_modules = root / "node_modules"
+    missing: list[str] = []
+    for name in deps:
+        dep_dir = node_modules / name
+        if not (dep_dir / "package.json").exists():
+            missing.append(name)
+    return missing
+
+
 def _update_node_dependencies() -> list[str]:
     """Refresh Node deps in the repo root and update workspaces.
 
@@ -8409,47 +8439,55 @@ def _update_node_dependencies() -> list[str]:
 
     nixos_env = with_hermes_node_path(_nixos_build_env())
 
-    # Step 1: root install (no workspace recursion).
-    # NOTE: capture_output=False here is deliberate (#18840) — optional
-    # postinstall scripts (e.g. @askjo/camofox-browser's browser-binary fetch)
-    # print download progress, and capturing it makes a long download look
-    # hung. The chatty npm-deprecation noise during `hermes update` comes from
-    # the *desktop* build, not this step; that one is captured to update.log.
-    root_args = [*extra_args, "--workspaces=false"]
-    root_result = _run_npm_install_deterministic(
+    # Single deterministic pass. Historically this ran two passes:
+    #   1. `npm ci --workspaces=false`  (root-only deps)
+    #   2. `npm ci --workspace ui-tui --workspace web` (scoped workspaces)
+    # `npm ci` wipes node_modules before reifying, so pass 2 removed what
+    # pass 1 had installed and never restored the root-only deps (agent-browser,
+    # @streamdown/math) — both passes exited 0, the ✓ branch fired, and
+    # browser tools were silently broken until the user ran `npm install
+    # agent-browser` by hand (#64354). A single invocation with
+    # --include-workspace-root plus every required workspace reifies the whole
+    # tree once, preserving root deps.
+    combined_args = [
+        *extra_args,
+        "--include-workspace-root",
+        "--workspace", "ui-tui",
+        "--workspace", "web",
+    ]
+    result = _run_npm_install_deterministic(
         npm,
         PROJECT_ROOT,
-        extra_args=tuple(root_args),
+        extra_args=tuple(combined_args),
         capture_output=False,
         env=nixos_env,
     )
-    if root_result.returncode != 0:
-        print("  ⚠ npm install failed in repo root")
-        stderr = (root_result.stderr or "").strip() if root_result.stderr else ""
-        if stderr:
-            print(f"    {stderr.splitlines()[-1]}")
-        return _partial_update_failure("repo root")
-
-    # Step 2: install only the workspaces update needs (ui-tui, web).
-    # --workspace selects specific workspaces; the rest (desktop) are skipped.
-    ws_args = [*extra_args, "--workspace", "ui-tui", "--workspace", "web"]
-    ws_result = _run_npm_install_deterministic(
-        npm,
-        PROJECT_ROOT,
-        extra_args=tuple(ws_args),
-        capture_output=False,
-        env=nixos_env,
-    )
-    if ws_result.returncode == 0:
+    if result.returncode == 0:
+        # Silent-failure hardening (#64354): `npm ci` wipes node_modules
+        # before reifying, and a single combined pass can still fail to
+        # materialize a declared root dep without a non-zero exit (e.g. a
+        # postinstall no-op, a hoist collision, or a partial/cancelled
+        # reify). If a declared root dependency is not present on disk after
+        # a 0-exit install, surface it instead of printing ✓ — otherwise
+        # browser tools (agent-browser, @streamdown/math) break silently.
+        missing = _missing_root_deps(PROJECT_ROOT)
+        if missing:
+            names = ", ".join(missing)
+            print(f"  ⚠ npm install reported success but these root "
+                  f"dependencies are missing from node_modules/: {names}")
+            if any("agent-browser" in m or "streamdown" in m for m in missing):
+                print("    Browser tooling may be broken until you run "
+                      "`npm install` in the repo root by hand.")
+            return _partial_update_failure("repo root")
         _record_npm_lockfile_hash(shared_hermes_root)
         print("  ✓ repo root + ui-tui, web workspaces (desktop skipped)")
         return []
 
-    print("  ⚠ npm workspace install failed")
-    stderr = (ws_result.stderr or "").strip() if ws_result.stderr else ""
+    print("  ⚠ npm install failed")
+    stderr = (result.stderr or "").strip() if result.stderr else ""
     if stderr:
         print(f"    {stderr.splitlines()[-1]}")
-    return _partial_update_failure("ui-tui, web workspaces")
+    return _partial_update_failure("repo root")
 
 
 class _UpdateOutputStream:
