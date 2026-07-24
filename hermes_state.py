@@ -34,6 +34,48 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 logger = logging.getLogger(__name__)
 
 
+def _log_session_archive(
+    db_path: "Path | None",
+    target_session_id: str,
+    archived: bool,
+    rowcount: int,
+) -> None:
+    """Append a one-line JSON record for a successful archive/unarchive.
+
+    Used by :meth:`SessionDB.set_session_archived` so an unexpected cascade
+    leaves a recoverable audit trail outside the SQLite database itself
+    (the ``state.db`` row is the only record of what was archived, and a
+    user's own data dir is the only durable place an investigation can look
+    after the fact). The write is intentionally best-effort — a write
+    failure must never fail an archive call, since a downstream file-system
+    hiccup does not justify a refused user action.
+
+    Profile-aware: ``db_path`` resolves the specific profile directory when
+    a profile-scoped state.db is in use, so two profiles don't share a log
+    file. Falls back to the shared ``~/.hermes`` root when ``db_path`` is
+    unset (the default ``SessionDB()`` constructor path).
+    """
+    try:
+        if db_path is None:
+            log_dir = get_hermes_home() / "logs"
+        else:
+            log_dir = Path(db_path).resolve().parent / "logs"
+
+        log_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "ts": time.time(),
+            "target": target_session_id,
+            "archived": bool(archived),
+            "rowcount": int(rowcount),
+        }
+        with (log_dir / "archives.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload))
+            handle.write("\n")
+    except Exception as exc:
+        # Never fail an archive call because of the audit append.
+        logger.debug("archive audit log failed: %s", exc)
+
+
 def _scrub_surrogates(value: Any) -> Any:
     """Replace lone surrogates when *value* is text; pass anything else through.
 
@@ -4942,6 +4984,14 @@ class SessionDB:
         chains, archive the whole logical conversation. Desktop lists compression
         roots projected forward to their latest continuation; updating only the
         displayed tip lets the still-unarchived root resurrect it on refresh.
+
+        Because the ancestral CTE silently walks the compression lineage, this
+        call can flip tens of sessions in one round-trip. Every successful call
+        is appended to ``<hermes_home>/logs/archives.jsonl`` so an unexpected
+        cascade leaves a recoverable audit trail instead of vanishing silently.
+        Callers who need the blast radius before committing should run
+        :meth:`preview_session_archive_lineage` first.
+
         Returns True when at least one row was updated.
         """
         def _do(conn):
@@ -4982,7 +5032,86 @@ class SessionDB:
                 rowcount = conn.execute("SELECT changes()").fetchone()[0]
             return rowcount
         rowcount = self._execute_write(_do)
+        if rowcount > 0:
+            _log_session_archive(self.db_path, session_id, archived, rowcount)
         return rowcount > 0
+
+    def preview_session_archive_lineage(
+        self, session_id: str, archived: bool = True
+    ) -> Dict[str, Any]:
+        """Report the lineage that ``set_session_archived`` would mutate.
+
+        The CTE in :meth:`set_session_archived` is recursive: archiving one
+        session in a compression chain flips the whole chain in a single
+        statement, with no confirmation step. This helper runs the same walk
+        in read-only mode so callers (HTTP API, bulk CLI, curator) can surface
+        the blast radius — session count plus the oldest/newest timestamps in
+        the affected set — *before* committing.
+
+        Returns a dict with keys:
+          * ``cascade_count`` — number of rows that would change.
+          * ``cascade_extra`` — how many of those are NOT the targeted row
+            (``cascade_count - 1``; ``0`` when the lineage has no siblings).
+          * ``oldest_started_at`` / ``newest_started_at`` — epoch seconds from
+            the ``sessions.started_at`` column, useful for an "oldest: 12d,
+            newest: 4h" confirmation string.
+          * ``affected_ids`` — the full session-id list, in CTE order, for a
+            preview that names every row that would change.
+
+        A targeted row that has no compression ancestors/descendants returns
+        ``cascade_count == 1`` and a single-element ``affected_ids``. A
+        non-existent session id returns ``cascade_count == 0``.
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                """
+                WITH RECURSIVE
+                  ancestors(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  descendants(id) AS (
+                    SELECT ?
+                    UNION
+                    SELECT child.id
+                    FROM descendants d
+                    JOIN sessions parent ON parent.id = d.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  lineage(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT id FROM descendants
+                  )
+                SELECT id, started_at
+                FROM sessions
+                WHERE id IN (SELECT id FROM lineage)
+                  AND archived IS NOT ?
+                """,
+                (session_id, session_id, 1 if archived else 0),
+            )
+            return cursor.fetchall()
+
+        rows = self._execute_write(_do)
+        affected_ids = [row["id"] for row in rows]
+        started = [
+            row["started_at"]
+            for row in rows
+            if row["started_at"] is not None
+        ]
+        return {
+            "cascade_count": len(affected_ids),
+            "cascade_extra": max(0, len(affected_ids) - 1),
+            "oldest_started_at": min(started) if started else None,
+            "newest_started_at": max(started) if started else None,
+            "affected_ids": affected_ids,
+        }
 
     def get_session_by_title(self, title: str) -> Optional[Dict[str, Any]]:
         """Look up a session by exact title. Returns session dict or None."""

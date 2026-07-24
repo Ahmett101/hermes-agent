@@ -11516,6 +11516,13 @@ async def delete_session_endpoint(session_id: str, profile: Optional[str] = None
 class SessionRename(BaseModel):
     title: Optional[str] = None
     archived: Optional[bool] = None
+    # Caller opt-in to archiving when the compression-lineage CTE would
+    # cascade the flag to more than one session. Required (=True) when the
+    # targeted row participates in a chain with siblings; otherwise the
+    # endpoint returns 409 with the lineage preview so the caller can either
+    # send `confirm_cascade=True` or back out. Single-session updates
+    # (no compression lineage) still go through silently.
+    confirm_cascade: Optional[bool] = None
     # Mutate a session belonging to another profile (opens its state.db). Omit
     # for the current/default profile.
     profile: Optional[str] = None
@@ -11546,6 +11553,33 @@ async def rename_session_endpoint(session_id: str, body: SessionRename):
                 # Title too long, invalid characters, or already in use.
                 raise HTTPException(status_code=400, detail=str(e))
         if body.archived is not None:
+            # The CTE behind ``set_session_archived`` walks the whole
+            # compression lineage in one shot — archiving a single session
+            # in a chain silently flips every sibling. Refuse any cascade
+            # unless the caller explicitly opts in, and surface the blast
+            # radius (count + age span + affected ids) so a UI can render a
+            # real confirmation dialog instead of pretending one session
+            # is being archived in isolation. (#70185)
+            if body.archived is True:
+                preview = db.preview_session_archive_lineage(sid, archived=True)
+                if preview["cascade_extra"] > 0 and not body.confirm_cascade:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "reason": "archive_cascade",
+                            "session_id": sid,
+                            "cascade_count": preview["cascade_count"],
+                            "cascade_extra": preview["cascade_extra"],
+                            "oldest_started_at": preview["oldest_started_at"],
+                            "newest_started_at": preview["newest_started_at"],
+                            "affected_ids": preview["affected_ids"],
+                            "advice": (
+                                "Resend the request with confirm_cascade=True "
+                                "to archive the whole lineage, or archive an "
+                                "explicit id that has no compression siblings."
+                            ),
+                        },
+                    )
             db.set_session_archived(sid, body.archived)
         result = {"ok": True, "title": db.get_session_title(sid) or ""}
         if body.archived is not None:

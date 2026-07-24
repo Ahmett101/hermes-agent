@@ -1788,6 +1788,161 @@ class TestWebServerEndpoints:
         restored = self.client.get("/api/sessions").json()
         assert any(s["id"] == "arch-me" for s in restored["sessions"])
 
+    def test_patch_session_archive_cascade_returns_409_without_confirm(self):
+        """Archiving a compression lineage returns 409 unless confirm_cascade=True.
+
+        Replaces the silent "one tiny click silently hides 10 days of work"
+        with a real, machine-readable conflict so the desktop sidebar (and any
+        future orchestrator UI) can render a confirmation dialog keyed to the
+        exact lineage count and age span. (#70185)
+        """
+        import time
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session("cascade-root", source="desktop")
+            db.create_session("cascade-tip", source="desktop", parent_session_id="cascade-root")
+            base = time.time() - 100
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, ended_at = ?, end_reason = 'compression', message_count = 1 WHERE id = 'cascade-root'",
+                (base, base + 10),
+            )
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, message_count = 1 WHERE id = 'cascade-tip'",
+                (base + 20,),
+            )
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.patch("/api/sessions/cascade-tip", json={"archived": True})
+        assert resp.status_code == 409, resp.text
+        detail = resp.json()["detail"]
+        assert detail["reason"] == "archive_cascade"
+        assert detail["cascade_count"] == 2
+        assert detail["cascade_extra"] == 1
+        assert set(detail["affected_ids"]) == {"cascade-root", "cascade-tip"}
+        assert detail["oldest_started_at"] is not None
+        assert detail["newest_started_at"] is not None
+
+        # And nothing was actually archived — the cascade was refused, not silently half-applied.
+        # Read straight from the DB because the listing endpoint collapses
+        # compression projections (the root is shown via its later-touched
+        # child, so it won't necessarily appear by id on `/api/sessions`).
+        from hermes_state import SessionDB
+        verify_db = SessionDB()
+        try:
+            for sid in ("cascade-root", "cascade-tip"):
+                assert verify_db.get_session(sid)["archived"] == 0, sid
+        finally:
+            verify_db.close()
+
+    def test_patch_session_archive_cascade_with_confirm_proceeds(self):
+        """Passing confirm_cascade=True past the gate keeps the cascade archive working."""
+        import time
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session("allow-root", source="desktop")
+            db.create_session("allow-tip", source="desktop", parent_session_id="allow-root")
+            base = time.time() - 100
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, ended_at = ?, end_reason = 'compression', message_count = 1 WHERE id = 'allow-root'",
+                (base, base + 10),
+            )
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, message_count = 1 WHERE id = 'allow-tip'",
+                (base + 20,),
+            )
+            db._conn.commit()
+        finally:
+            db.close()
+
+        resp = self.client.patch(
+            "/api/sessions/allow-tip",
+            json={"archived": True, "confirm_cascade": True},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["archived"] is True
+
+        # The cascade really walked both rows. Verify straight from the DB
+        # because the listings endpoint collapses a compression lineage
+        # into a single projected row.
+        from hermes_state import SessionDB
+        verify_db = SessionDB()
+        try:
+            for sid in ("allow-tip", "allow-root"):
+                assert verify_db.get_session(sid)["archived"] == 1, sid
+        finally:
+            verify_db.close()
+
+    def test_patch_session_archive_single_session_no_cascade_gate(self):
+        """Lonely sessions (no compression lineage) don't trigger the new 409 gate.
+
+        The whole point of the fix is to keep the previous behaviour for the
+        common case while adding a checkpoint for the dangerous one.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session("lonely", source="desktop")
+            db.append_message(session_id="lonely", role="user", content="hi")
+        finally:
+            db.close()
+
+        resp = self.client.patch("/api/sessions/lonely", json={"archived": True})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["archived"] is True
+
+        listed = self.client.get("/api/sessions").json()
+        assert all(s["id"] != "lonely" for s in listed["sessions"])
+
+    def test_patch_session_unarchive_cascade_bypasses_gate(self):
+        """The 409 gate is archive-direction only — restoring a lineage must keep working.
+
+        A user wanting their archived sessions back would hate to be prompted
+        for confirmation before each unarchive, and a click that *fails to*
+        unarchive is far more recoverable than the inverse.
+        """
+        import time
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session("revive-root", source="desktop")
+            db.create_session("revive-tip", source="desktop", parent_session_id="revive-root")
+            base = time.time() - 100
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, ended_at = ?, end_reason = 'compression', message_count = 1 WHERE id = 'revive-root'",
+                (base, base + 10),
+            )
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ?, message_count = 1 WHERE id = 'revive-tip'",
+                (base + 20,),
+            )
+            db._conn.commit()
+            db.set_session_archived("revive-tip", True)
+        finally:
+            db.close()
+
+        # No confirm_cascade field — restore must not gate behind the new safety net.
+        resp = self.client.patch("/api/sessions/revive-tip", json={"archived": False})
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["archived"] is False
+
+        # Both rows were restored; verify via the DB because listings project
+        # compression lineages onto the latest touched endpoint.
+        from hermes_state import SessionDB
+        verify_db = SessionDB()
+        try:
+            for sid in ("revive-tip", "revive-root"):
+                assert verify_db.get_session(sid)["archived"] == 0, sid
+        finally:
+            verify_db.close()
+
     def test_patch_session_without_fields_is_400(self):
         """An existing session + empty body is a bad request, not a 404."""
         from hermes_state import SessionDB
