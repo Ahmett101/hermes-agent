@@ -933,6 +933,13 @@ class BaseEnvironment(ABC):
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
+                    # Reap is best-effort: _kill_process waits on the
+                    # subprocess but a defensive sync here is harmless if a
+                    # subclass overrides kill without a wait.
+                    try:
+                        proc.wait(timeout=2.0)
+                    except (ProcessLookupError, subprocess.TimeoutExpired, OSError):
+                        pass
                     return {
                         "output": output.render(suffix="\n[Command interrupted]"),
                         "returncode": 130,
@@ -946,6 +953,10 @@ class BaseEnvironment(ABC):
                         )
                     self._kill_process(proc)
                     drain_thread.join(timeout=2)
+                    try:
+                        proc.wait(timeout=2.0)
+                    except (ProcessLookupError, subprocess.TimeoutExpired, OSError):
+                        pass
                     timeout_msg = f"\n[Command timed out after {timeout}s]"
                     return {
                         "output": output.render(suffix=timeout_msg).lstrip()
@@ -1017,6 +1028,26 @@ class BaseEnvironment(ABC):
         except Exception:
             pass
 
+        # Reap the subprocess on the natural exit path.
+        #
+        # CPython's ``subprocess.Popen.__del__`` is *not* guaranteed to call
+        # ``wait()``, and the ``_ThreadedProcessHandle`` adapter used by SDK
+        # backends can keep its worker thread alive on a long-tail ``exec_fn``
+        # after the underlying process has exited (its ``wait()`` blocks on a
+        # ``threading.Event`` set inside that worker).  Returning without an
+        # explicit ``wait()`` leaks a zombie to the kernel PID table for the
+        # lifetime of the parent Hermes process — every ``terminal()`` /
+        # ``read_file`` / search invocation accumulates one (#71253).
+        try:
+            proc.wait(timeout=2.0)
+        except (ProcessLookupError, subprocess.TimeoutExpired, OSError):
+            # ProcessLookupError: a stranger (e.g. timeout path) already reaped
+            # this PID; nothing more to do.
+            # TimeoutExpired / OSError: the worker is still flushing; the
+            # next caller's execute() will encounter a finished handle and
+            # wait() in its own path, completing cleanup.
+            pass
+
         if _DEBUG_INTERRUPT:
             logger.info(
                 "[interrupt-debug] _wait_for_process EXIT (natural) "
@@ -1029,10 +1060,33 @@ class BaseEnvironment(ABC):
         return {"output": output.render(), "returncode": proc.returncode}
 
     def _kill_process(self, proc: ProcessHandle):
-        """Terminate a process. Subclasses may override for process-group kill."""
+        """Terminate a process and reap it.
+
+        Subclasses may override for process-group kill; they are responsible
+        for reap support (``proc.wait()`` or equivalent) themselves and need
+        not route through here.  Subclasses that *do* delegate back into this
+        implementation (e.g. when no process-group semantics are required)
+        inherit the wait/reap contract below.
+
+        The wait protects the kernel's process table from zombies:
+        ``subprocess.Popen.__del__`` is documented NOT to call ``wait()``,
+        and the other ``ProcessHandle`` adapters in this module can keep their
+        worker thread alive on a long-tail ``exec_fn()`` unless we
+        synchronously block on their completion here (#71253).
+        """
         try:
             proc.kill()
         except (ProcessLookupError, PermissionError, OSError):
+            pass
+        # Reap regardless of whether kill() found the process — the previous
+        # owner may already have reaped it, in which case wait() is a no-op.
+        try:
+            proc.wait(timeout=5.0)
+        except (ProcessLookupError, subprocess.TimeoutExpired, OSError):
+            # ProcessLookupError: already reaped (or never existed) — fine.
+            # TimeoutExpired: still won't go; the next poll cycle / a manual
+            # ``kill -9`` can finish cleanup.  We deliberately do not block the
+            # tool forever — the process is going away, just slowly.
             pass
 
     # ------------------------------------------------------------------

@@ -512,6 +512,120 @@ class TestInitSessionFailure:
         assert calls[0]["login"] is False
 
 
+class TestProcessReaping:
+    """Regression tests for issue #71253.
+
+    _wait_for_process must reap its subprocess on every return path
+    (natural exit, KeyboardInterrupt, timeout) by calling ``proc.wait()``,
+    so that Popen objects do not leak zombie entries to the OS.
+    """
+
+    @staticmethod
+    def _make_proc(rc=0):
+        proc = MagicMock()
+        proc.poll.return_value = rc
+        proc.returncode = rc
+        proc.stdout = iter([])
+        return proc
+
+    def test_natural_exit_reaps_subprocess(self):
+        env = _TestableEnv()
+        proc = self._make_proc(rc=0)
+
+        def mock_run_bash(cmd, *, login=False, timeout=120, stdin_data=None):
+            return proc
+
+        env._run_bash = mock_run_bash
+        result = env.execute("echo natural")
+
+        assert result["returncode"] == 0
+        # proc.wait() MUST be called exactly once on the natural exit path
+        # so the kernel can release the PID entry.
+        proc.wait.assert_called_once()
+
+    def test_interrupt_exit_reaps_subprocess(self):
+        """KeyboardInterrupt-equivalent path: _wait_for_process returns 130
+        and must still call proc.wait() to avoid leaking a zombie."""
+        env = _TestableEnv()
+        proc_holder = {}
+
+        def mock_run_bash(cmd, *, login=False, timeout=120, stdin_data=None):
+            p = MagicMock()
+            # Stay running for the first poll so the loop sees the interrupt
+            # branch; then return 130 via _wait_for_process.
+            poll_calls = {"n": 0}
+
+            def _poll():
+                poll_calls["n"] += 1
+                return None if poll_calls["n"] == 1 else 130
+
+            p.poll.side_effect = _poll
+            p.returncode = 130
+            p.stdout = iter([])
+            proc_holder["p"] = p
+            return p
+
+        env._run_bash = mock_run_bash
+
+        # Stub ``is_interrupted`` so the loop takes the interrupt branch on
+        # the first poll, then returns cleanly on the second tick.
+        from tools.environments import base as base_mod
+
+        state = {"hit": False}
+
+        def mixed_is_interrupted():
+            if not state["hit"]:
+                state["hit"] = True
+                return True
+            return False
+
+        original = base_mod.is_interrupted
+        base_mod.is_interrupted = mixed_is_interrupted
+        try:
+            result = env.execute("echo interrupt")
+        finally:
+            base_mod.is_interrupted = original
+
+        assert result["returncode"] == 130
+        proc_holder["p"].wait.assert_called()
+
+    def test_timeout_exit_reaps_subprocess(self):
+        """Timeout path: _wait_for_process returns 124 and must still reap."""
+        env = _TestableEnv()
+        proc = MagicMock()
+        poll_calls = {"n": 0}
+
+        def _poll():
+            poll_calls["n"] += 1
+            return None if poll_calls["n"] <= 1 else None  # never exits naturally
+
+        proc.poll.side_effect = _poll
+        proc.stdout = iter([])
+
+        def mock_run_bash(cmd, *, login=False, timeout=120, stdin_data=None):
+            return proc
+
+        env._run_bash = mock_run_bash
+        env._kill_process = lambda p: None  # avoid touching real kill in mock
+        # Tight timeout to trigger the timeout branch quickly.
+        result = env.execute("sleep 999", timeout=0.05)
+
+        assert result["returncode"] == 124
+        proc.wait.assert_called()
+
+    def test_base_kill_process_waits_for_reap(self):
+        """BaseEnvironment._kill_process must wait() after kill() so a
+        killed but unreaped subprocess does not become a zombie."""
+        env = _TestableEnv()
+        proc = MagicMock()
+
+        env._kill_process(proc)
+
+        proc.kill.assert_called_once()
+        # Critical reaping assertion — currently absent in base class.
+        proc.wait.assert_called()
+
+
 class TestCwdMarker:
     def test_marker_contains_session_id(self):
         env = _TestableEnv()
