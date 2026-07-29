@@ -33,7 +33,7 @@ import { ContextMenu } from './context-menu'
 import { COMPOSER_AREAS, runComposerMiddleware } from './contrib'
 import { ComposerControls } from './controls'
 import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from './drop-affordance'
-import { markActiveComposer } from './focus'
+import { markActiveComposer, registerMountedComposer, unregisterMountedComposer } from './focus'
 import { HelpHint } from './help-hint'
 import { useAtCompletions } from './hooks/use-at-completions'
 import { useComposerBranch } from './hooks/use-composer-branch'
@@ -839,6 +839,19 @@ export function ChatBar({
   // Global Esc-to-cancel when the chat (not the composer input) has focus.
   // Same explicit-halt semantics as the Stop button: park the queue.
   useComposerEscCancel({ awaitingInput, busy, onCancel: haltRun, target: scope.target })
+
+  // Register this composer as mounted so the global Esc-to-cancel fallback can
+  // pick the right target when the focus bus is stale (e.g. the user clicked
+  // into the transcript and never gave the composer input focus). Unmount
+  // cleans up — leaving a stale target in the set would make the fallback
+  // resolve to a phantom composer and silently no-op.
+  useEffect(() => {
+    registerMountedComposer(scope.target)
+
+    return () => {
+      unregisterMountedComposer(scope.target)
+    }
+  }, [scope.target])
 
   const {
     conversation,

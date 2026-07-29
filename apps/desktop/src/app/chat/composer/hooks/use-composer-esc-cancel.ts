@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react'
 
 import { triggerHaptic } from '@/lib/haptics'
 
-import { type ComposerTarget, getActiveComposer } from '../focus'
+import { type ComposerTarget, getActiveComposer, getMountedComposers } from '../focus'
 
 interface UseComposerEscCancelOptions {
   awaitingInput: boolean
@@ -11,6 +11,50 @@ interface UseComposerEscCancelOptions {
   /** This composer's focus-bus key. With N composers mounted (main + tiles),
    *  only the active one's Esc cancels — otherwise every busy tile stops. */
   target: ComposerTarget
+}
+
+/**
+ * Pick the composer that should receive an Esc-to-cancel press.
+ *
+ *  - `activeTarget` matches this composer: that's the bus's authoritative
+ *    answer, take it.
+ *  - `activeTarget` is stale (e.g. the focus tracker points at a composer that
+ *    has since unmounted, or never updated because focus never landed on a
+ *    composer input): if exactly one mounted composer is currently busy,
+ *    that's almost certainly the one the user can see — fire it.
+ *  - Ambiguous (multiple busy mounted composers, or none busy): no-op. Better
+ *    to leave a runaway tile running than to halt the wrong one.
+ *
+ *  Pure: pass in the live `getMountedComposers()` snapshot so this function
+ *  stays testable without a DOM.
+ */
+export const resolveEscTarget = (
+  target: ComposerTarget,
+  activeTarget: ComposerTarget,
+  busyByTarget: ReadonlyMap<ComposerTarget, boolean>,
+  mounted: ReadonlySet<ComposerTarget>
+): ComposerTarget | null => {
+  // Authoritative path: the focus bus already points at this composer. The
+  // mount check guards against the tracker pointing at an unmounted tile.
+  if (activeTarget === target && mounted.has(target)) {
+    return target
+  }
+
+  // Stale-tracker fallback: if there's exactly one mounted busy composer, that
+  // is the one the user can see — even if the focus bus disagrees.
+  const busyMounted: ComposerTarget[] = []
+
+  for (const t of mounted) {
+    if (busyByTarget.get(t)) {
+      busyMounted.push(t)
+    }
+  }
+
+  if (busyMounted.length === 1) {
+    return busyMounted[0]
+  }
+
+  return null
 }
 
 /**
@@ -37,7 +81,26 @@ export function useComposerEscCancel({ awaitingInput, busy, onCancel, target }: 
 
     // Only the focused composer cancels — otherwise every mounted busy tile
     // stops at once (and the winner would be mount-order arbitrary).
-    if (getActiveComposer() !== target) {
+    // `resolveEscTarget` falls back to the lone mounted busy composer when the
+    // focus bus is stale (tab switch, mount race, focus never landed), so Esc
+    // still works from the transcript on a single-composer chat.
+    const busyByTarget = new Map<ComposerTarget, boolean>([[target, busy]])
+    const mounted = getMountedComposers()
+
+    // Co-mount any other composers the bus tracks, marked non-busy here: a
+    // sibling tile can't be considered busy from this hook, so the helper
+    // sees "this composer is busy, others are not". `resolveEscTarget` will
+    // still prefer us when `getActiveComposer() === target`, and fall back to
+    // us when we're the lone busy mounted composer.
+    for (const t of mounted) {
+      if (!busyByTarget.has(t)) {
+        busyByTarget.set(t, false)
+      }
+    }
+
+    const resolved = resolveEscTarget(target, getActiveComposer(), busyByTarget, mounted)
+
+    if (resolved !== target) {
       return
     }
 

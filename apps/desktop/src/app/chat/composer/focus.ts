@@ -166,6 +166,27 @@ export const markActiveComposer = (target: ComposerTarget) => {
   activeTarget = target
 }
 
+// Track which composers are currently mounted. The active-target tracker is
+// driven by input focus, which can lag reality across tab swaps, tile mounts,
+// and dialog restores — but Esc-cancel must fire for whatever composer is
+// actually live. We use this set as the source of truth when the focus tracker
+// is stale: if `activeTarget` doesn't resolve to a mounted composer, fall back
+// to the lone mounted busy composer.
+const mountedComposers = new Set<ComposerTarget>()
+
+export const registerMountedComposer = (target: ComposerTarget) => {
+  mountedComposers.add(target)
+}
+
+export const unregisterMountedComposer = (target: ComposerTarget) => {
+  mountedComposers.delete(target)
+}
+
+/** Snapshot of currently mounted composers. The returned set is a copy — it is
+ *  safe to iterate but mutating it does not affect the registry. */
+export const getMountedComposers = (): ReadonlySet<ComposerTarget> =>
+  new Set(mountedComposers)
+
 /** Hand the routing key back when a composer unmounts, so `'active'` can never
  *  resolve to a composer that no longer has a subscriber — such a request is
  *  dispatched and then dropped by every mounted composer's target filter, and
