@@ -169,10 +169,59 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
 
 
 def _warm_gateway_module() -> None:
+    """Synchronously import hermes_cli.gateway so the cold-import cost
+    (.pyc compilation + Defender real-time scan on Windows) is paid by the
+    caller. Used by ``_warm_gateway_in_subprocess``; left in place so unit
+    tests that want to patch a synchronous warmup can still do so."""
     try:
         import hermes_cli.gateway  # noqa: F401
     except Exception:
         pass
+
+
+def _warm_gateway_in_subprocess() -> "subprocess.Popen[bytes] | None":
+    """Spawn a detached Python subprocess that *only* imports
+    ``hermes_cli.gateway`` so the .pyc compilation + OS file-system cache
+    warmth happens off-process. A subprocess does not share the GIL with
+    the main process, so the parent's event loop cannot be starved — even
+    under worst-case Defender-scan delays on a fresh Windows install.
+
+    The subprocess is fire-and-forget: we return the ``Popen`` handle so
+    the caller can ``wait()`` during shutdown for clean teardown. We do
+    NOT ``communicate()`` here because that would block until the child
+    exits, which defeats the point. Stdout/stderr are redirected to
+    ``DEVNULL`` so a stray import-time print cannot corrupt the dashboard
+    HTTP response stream.
+
+    Returns ``None`` if ``sys.executable`` is unavailable or the spawn
+    itself fails (e.g. POSIX ``exec`` denied). Callers must tolerate
+    ``None`` — the worst case is that cold import still happens on first
+    request, which is no worse than before this helper existed.
+    """
+    import subprocess
+    import sys
+
+    exe = sys.executable
+    if not exe:
+        return None
+    # Cross-platform detached spawn. On POSIX, ``start_new_session=True``
+    # detaches the child from the parent's process group so a Ctrl-C in
+    # the parent doesn't propagate. On Windows, ``creationflags=
+    # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`` achieves the same;
+    # we use the platform-portable ``start_new_session=True`` because it
+    # is a no-op on Windows but harmless and avoids the
+    # ``signal.SIGKILL`` footgun (CREATE_NEW_PROCESS_GROUP also exists on
+    # Windows without touching SIGKILL).
+    try:
+        return subprocess.Popen(
+            [exe, "-c", "import hermes_cli.gateway"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, ValueError):
+        return None
 
 
 def _resolve_restart_drain_timeout() -> float:
@@ -195,13 +244,20 @@ async def _lifespan(app: "FastAPI"):
     # event loop during lifespan startup — see _get_event_state's docstring.
     app.state.chat_argv_lock = asyncio.Lock()
 
-    # Fire hermes_cli.gateway import into a background thread so the event
-    # loop is not blocked and HERMES_DASHBOARD_READY fires without delay.
-    # On a cold Windows install the module chain triggers .pyc compilation
-    # and Defender real-time scans that can stall the event loop for 15-30s.
-    # Running in an executor means the cost is paid in a worker thread while
-    # the server socket is already open and accepting probes.
-    asyncio.get_event_loop().run_in_executor(None, _warm_gateway_module)
+    # Cold-import prewarm for ``hermes_cli.gateway``. The first real use
+    # of the gateway module is ``/api/status`` (``_resolve_restart_drain_timeout``),
+    # and on a fresh Windows install the import triggers .pyc compilation
+    # + Defender real-time scans that can stall the GIL for 15-30s.
+    #
+    # The previous fix (a thread executor) didn't actually isolate the
+    # event loop: the executor thread shares the GIL with the main process,
+    # so a long .pyc compilation run can still starve /api/health probes
+    # and the WebSocket ``gateway.ready`` handshake. We now spawn a
+    # *detached subprocess* that only does the import — a subprocess has
+    # its own GIL, so the parent event loop cannot be starved, while the
+    # cold-import cost is paid proactively instead of on first real request.
+    # See issue #73830 for the residual-gap rationale.
+    prewarm_proc = _warm_gateway_in_subprocess()
 
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes
@@ -238,6 +294,17 @@ async def _lifespan(app: "FastAPI"):
         await PTY_REGISTRY.close_all()
         if cron_stop is not None:
             cron_stop.set()
+        # Subprocess prewarm cleanup. Best-effort: the child has its own
+        # process group (``start_new_session=True``), so it will not block
+        # our shutdown. If it's still alive (slow cold import in progress)
+        # we wait up to 5s, then detach — the child will finish on its
+        # own and ``sys.modules`` will be populated for any subsequent
+        # ``hermes`` invocation sharing this user's caches.
+        if prewarm_proc is not None and prewarm_proc.poll() is None:
+            try:
+                prewarm_proc.wait(timeout=5)
+            except Exception:
+                pass
 
 
 def _get_event_state(app: "FastAPI"):
