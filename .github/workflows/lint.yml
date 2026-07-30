@@ -160,3 +160,27 @@ jobs:
 
       - name: Run footgun checker
         run: python scripts/check-windows-footguns.py --all
+
+  pyproject-py-modules:
+    # Guards the #5502 / #74620 regression class: a root-level *.py file
+    # that isn't declared in [tool.setuptools].py-modules ships fine via
+    # ``pip install -e .`` (it just runs from the repo tree) but is
+    # silently omitted from a sealed uv2nix wheel build, surfacing as a
+    # runtime ModuleNotFoundError for Nix users only. Forward-declared
+    # entries (in the list but no file on disk yet) are warnings, not
+    # errors, so a fix that pre-declares a module before the .py file
+    # ships doesn't block its own PR.
+    name: pyproject.py-modules coverage (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Run py-modules coverage check
+        run: python scripts/check-pyproject-py-modules.py
