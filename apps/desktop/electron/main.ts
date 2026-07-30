@@ -31,7 +31,7 @@ import {
 import nodePty from 'node-pty'
 
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
-import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
+import { dashboardFallbackArgs, probeServeSupport, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, normalizeHermesHomeRoot } from './backend-env'
 import { canImportHermesCli, shouldTrustHermesOverride, verifyHermesCli } from './backend-probes'
@@ -1648,59 +1648,120 @@ function unwrapWindowsVenvHermesCommand(command, backendArgs) {
 // installs, dev checkouts, and the Windows venv). Fallback: probe the CLI once
 // (covers a bare `hermes` resolved from PATH with no known source root). Result
 // is cached per resolved runtime so we probe at most once per backend.
-const _serveSupportCache = new Map()
+//
+// #74563 follow-up: a previous synchronous `execFileSync` here blocked the
+// boot path for up to 15s on cold Windows installs (Defender scan + venv
+// activation), and a single failed probe poisoned the cache for the rest of
+// the process, forcing every later launch into the legacy `dashboard --no-open`
+// path even after the runtime was healthy. We now (a) run the probe async with
+// a tight 8s ceiling so the splash can keep painting, (b) record the *reason*
+// for the decision so users can diagnose without custom logging, and (c) honor
+// HERMES_DESKTOP_RESET_SERVE_PROBE=1 to flush a poisoned cache without
+// restarting the app.
+type _ServeCacheEntry = { value: boolean; reason: string }
+const _serveSupportCache = new Map<string, _ServeCacheEntry>()
 
-function backendSupportsServe(backend) {
+function _flushServeSupportCache() {
+  // Used by tests and by the HERMES_DESKTOP_RESET_SERVE_PROBE escape hatch.
+  _serveSupportCache.clear()
+}
+
+async function backendSupportsServe(backend, { rememberLog: rememberLogFn = rememberLog } = {}) {
   if (!backend || !backend.command) {
-    return true
+    // No resolved runtime to probe — assume serve (the bootstrap-needed
+    // sentinel can't spawn anything anyway, and downstream code handles it).
+    return { supported: true, reason: 'no-resolved-runtime' }
   }
 
   const key = `${backend.command}::${backend.root || ''}`
 
-  if (_serveSupportCache.has(key)) {
-    return _serveSupportCache.get(key)
+  // Honour the diagnostic env var so a poisoned cache (the exact failure mode
+  // from #74563: one slow first launch, every subsequent launch routed through
+  // dashboard --no-open) can be flushed without restarting the app.
+  if (process.env.HERMES_DESKTOP_RESET_SERVE_PROBE === '1') {
+    _serveSupportCache.delete(key)
   }
 
-  let supported = null
+  if (_serveSupportCache.has(key)) {
+    const hit = _serveSupportCache.get(key)
 
+    rememberLogFn(`[backend] \`serve\` cache hit for ${backend.label || key}: ${hit.reason}`)
+
+    return { supported: hit.value, reason: `cache:${hit.reason}` }
+  }
+
+  // Fast path — read the runtime's own source. Instant, no subprocess.
   if (backend.root) {
     try {
       const src = fs.readFileSync(path.join(backend.root, 'hermes_cli', 'subcommands', 'dashboard.py'), 'utf8')
-      supported = sourceDeclaresServe(src)
-    } catch {
-      supported = null // source unreadable — fall through to the probe
+
+      if (sourceDeclaresServe(src)) {
+        const entry: _ServeCacheEntry = { value: true, reason: 'source-scan: add_parser("serve") matched' }
+
+        _serveSupportCache.set(key, entry)
+        rememberLogFn(`[backend] \`serve\` supported for ${backend.label || key} — ${entry.reason}`)
+
+        return { supported: true, reason: entry.reason }
+      }
+
+      const absent: _ServeCacheEntry = { value: false, reason: 'source-scan: no add_parser("serve") in dashboard.py' }
+
+      _serveSupportCache.set(key, absent)
+      rememberLogFn(`[backend] \`serve\` unsupported for ${backend.label || key} — ${absent.reason}; routing via legacy \`dashboard\``)
+
+      return { supported: false, reason: absent.reason }
+    } catch (err) {
+      const code = err && typeof err === 'object' && 'code' in err ? String((err as { code?: unknown }).code) : null
+      const msg = code || 'unreadable'
+      rememberLogFn(`[backend] \`serve\` source scan failed for ${backend.label || key} (${msg}); falling through to exec probe`)
+      // Fall through to the exec probe.
     }
   }
 
-  if (supported === null) {
-    try {
-      const prefix = backend.args && backend.args[0] === '-m' ? backend.args.slice(0, 2) : []
-      execFileSync(backend.command, [...prefix, 'serve', '--help'], {
-        cwd: backend.root || undefined,
-        env: { ...process.env, HERMES_HOME, ...(backend.env || {}) },
-        timeout: 15000,
-        stdio: 'ignore',
-        windowsHide: true
-      })
-      supported = true
-    } catch {
-      supported = false
-    }
+  // Slow path — async exec probe (capped at 8s; deliberately well below the
+  // 45s cold-start floor so the boot path never waits longer on a defensive
+  // probe than it would on the actual spawn that follows).
+  let probeResult: Awaited<ReturnType<typeof probeServeSupport>> = 'timeout'
+  let probeDetail = ''
+
+  try {
+    probeResult = await probeServeSupport(backend, { timeoutMs: 8000 })
+    probeDetail = probeResult === true ? 'serve --help exited 0' : probeResult === false ? 'serve --help exited non-zero' : probeResult
+  } catch (err) {
+    probeResult = 'error'
+    probeDetail = err && typeof err === 'object' && 'message' in err ? String((err as { message?: unknown }).message) : 'probe threw'
   }
 
-  _serveSupportCache.set(key, supported)
-  rememberLog(
-    `[backend] \`serve\` ${supported ? 'supported' : 'unsupported → routing via legacy `dashboard`'} for ${backend.label || key}`
+  if (probeResult === true) {
+    const entry: _ServeCacheEntry = { value: true, reason: `exec-probe: ${probeDetail}` }
+
+    _serveSupportCache.set(key, entry)
+    rememberLogFn(`[backend] \`serve\` supported for ${backend.label || key} — ${entry.reason}`)
+
+    return { supported: true, reason: entry.reason }
+  }
+
+  const unsupportedReason = `exec-probe: ${probeDetail}`
+  const entry: _ServeCacheEntry = { value: false, reason: unsupportedReason }
+
+  _serveSupportCache.set(key, entry)
+  rememberLogFn(
+    `[backend] \`serve\` unsupported for ${backend.label || key} — ${unsupportedReason}; routing via legacy \`dashboard\`` +
+      (probeResult === 'timeout'
+        ? ' (probe timeout — runtime may be cold-starting; check HERMES_DESKTOP_RESET_SERVE_PROBE if this persists)'
+        : '')
   )
 
-  return supported
+  return { supported: false, reason: unsupportedReason }
 }
 
 // Given a resolved backend whose args target `serve`, return the args the
 // runtime actually understands: unchanged when `serve` is supported, or
 // rewritten to `dashboard --no-open` for older runtimes.
-function getBackendArgsForRuntime(backend) {
-  return backendSupportsServe(backend) ? backend.args : dashboardFallbackArgs(backend.args)
+async function getBackendArgsForRuntime(backend) {
+  const { supported } = await backendSupportsServe(backend)
+
+  return supported ? backend.args : dashboardFallbackArgs(backend.args)
 }
 
 function normalizeExecutablePathForCompare(commandPath) {
@@ -7599,7 +7660,7 @@ async function spawnPoolBackend(profile, entry) {
   const backendArgs = ['--profile', profile, 'serve', '--host', '127.0.0.1', '--port', '0']
   const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
   // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
-  backend.args = getBackendArgsForRuntime(backend)
+  backend.args = await getBackendArgsForRuntime(backend)
   const hermesCwd = resolveHermesCwd()
   const webDist = resolveWebDist()
   const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
@@ -7856,7 +7917,7 @@ async function startHermes() {
     await advanceBootProgress('backend.runtime', 'Resolving Hermes runtime', 28)
     const backend = await ensureRuntime(resolveHermesBackend(backendArgs))
     // Route old runtimes (no `serve`) through the legacy `dashboard --no-open`.
-    backend.args = getBackendArgsForRuntime(backend)
+    backend.args = await getBackendArgsForRuntime(backend)
     const hermesCwd = resolveHermesCwd()
     const webDist = resolveWebDist()
     const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
