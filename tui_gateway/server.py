@@ -12987,8 +12987,26 @@ def _(rid, params: dict) -> dict:
             "owner_surface": existing_surface or None,
         })
     except Exception as e:
+        # The engine failed AFTER passing check_wake_word_requirements —
+        # the worst possible silent-failure mode. Carry the exception text
+        # to the caller AND the Windows 25H2 System32 onnxruntime shadow
+        # hint when applicable, so the GUI can surface an actionable banner
+        # instead of leaving a "feature on, never fires" listener running.
+        # See https://github.com/NousResearch/hermes-agent/issues/76296.
         logger.warning("wake.start(%s): failed to start listener: %s", surface, e)
-        return _err(rid, 5026, str(e))
+        hint = ""
+        try:
+            from tools.wake_word import detect_system32_onnxruntime_shadow
+
+            hint = detect_system32_onnxruntime_shadow() or ""
+        except Exception:
+            hint = ""
+        return _ok(rid, {
+            "started": False,
+            "reason": "start_failed",
+            "error": str(e),
+            "hint": hint,
+        })
     global _wake_owner_transport, _wake_owner_surface
     with _wake_lock:
         _wake_owner_transport = transport

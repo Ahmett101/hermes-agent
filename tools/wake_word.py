@@ -49,6 +49,15 @@ SAMPLE_RATE = 16000
 _FIRE_COOLDOWN_SECONDS = 2.0
 _START_TIMEOUT_SECONDS = 5.0
 
+# Windows 25H2 ships its own onnxruntime.dll inside System32 (a Microsoft
+# "os-germanium" component). It coexists with the PyPI wheel's onnxruntime
+# and can shadow the wheel's DLL during onnxruntime import, producing
+# WinError 1114 when the PyPI wheel tries to initialize against the older
+# MSVC runtime that System32 also ships. Detect the shadow once and surface
+# a remediation hint so the failure is not silent. Non-Windows platforms
+# always report "not shadowed".
+_WIN_SYSTEM32_ONNXRUNTIME = "C:\\Windows\\System32\\onnxruntime.dll"
+
 # Ambient-speech rejection: openWakeWord scores one ~80ms frame at a time, and a
 # stray phoneme in background conversation can spike a single frame over the
 # threshold. A real utterance of the phrase holds the score high across several
@@ -151,6 +160,48 @@ def resolve_inference_framework(cfg: Dict[str, Any]) -> str:
 
     return framework
 
+
+_warned_system32_onnx_shadow = False
+
+
+def detect_system32_onnxruntime_shadow() -> Optional[str]:
+    """Detect Windows' System32 onnxruntime.dll shadowing the PyPI wheel.
+
+    Returns a user-facing remediation hint when the shadow is present, or
+    ``None`` on every other platform / configuration. The detection runs at
+    most once per process: callers can gate expensive recovery work on the
+    boolean side (presence/absence) without re-stat'ing System32 on every
+    frame. Non-Windows hosts always get ``None``.
+
+    Windows 25H2 ships ``onnxruntime.dll`` inside ``System32`` as part of the
+    "os-germanium" component. The PyPI wheel's DLL still loads, but its
+    initialization path can fail against System32's older MSVC runtime
+    (WinError 1114), which used to surface only as a single ``logger.warning``
+    inside the wake engine. Reporting the shadow early lets the rest of the
+    wake pipeline surface an actionable hint to the user instead of failing
+    silently while the listener looks armed.
+    """
+    global _warned_system32_onnx_shadow
+    if sys.platform != "win32":
+        return None
+    try:
+        if os.path.isfile(_WIN_SYSTEM32_ONNXRUNTIME):
+            hint = (
+                "Windows System32 contains an onnxruntime.dll that can shadow "
+                "the PyPI wheel's onnxruntime and break openWakeWord. See "
+                "https://github.com/NousResearch/hermes-agent/issues/76296."
+            )
+            if not _warned_system32_onnx_shadow:
+                _warned_system32_onnx_shadow = True
+                logger.warning(
+                    "wake word: detected %s on this Windows host; the PyPI "
+                    "onnxruntime wheel may fail to initialize (WinError 1114).",
+                    _WIN_SYSTEM32_ONNXRUNTIME,
+                )
+            return hint
+    except OSError:
+        return None
+    return None
 
 
 def ensure_tflite_runtime() -> bool:
@@ -846,6 +897,15 @@ def check_wake_word_requirements(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
         )
         hint = (f"Wake word needs {missing} configured — run `hermes tools` "
                 f"(Voice section) or see the voice-mode docs.")
+
+    # Windows 25H2 ships its own onnxruntime.dll in System32, which can
+    # shadow the PyPI wheel during openWakeWord's import and break the wake
+    # engine with WinError 1114. When deps look fine but the wheel will still
+    # shadow System32's DLL at load time, surface that as the primary
+    # remediation instead of letting the listener arm and never fire.
+    shadow_hint = detect_system32_onnxruntime_shadow()
+    if shadow_hint and not hint:
+        hint = shadow_hint
 
     return {
         "available": key_ok and stt_ok and tts_ok and tflite_ok

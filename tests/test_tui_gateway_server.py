@@ -1724,6 +1724,62 @@ def test_wake_toggle_persists_enabled_flag_only_on_explicit_gesture(monkeypatch)
         server._wake_owner_surface = ""
 
 
+def test_wake_start_surfaces_engine_failure_instead_of_silent_warning(monkeypatch):
+    """#76296: a wake engine failure must reach the caller, not a single logger.warning.
+
+    Windows 25H2's System32 onnxruntime.dll can shadow the PyPI wheel and
+    crash openWakeWord during import (WinError 1114). The wake word arms
+    but never fires, and dependent tools (browser/vision) flip to
+    check_fn=False. Carry the exception text AND the System32 shadow hint
+    back to the GUI so it can show a banner instead of a silent dead ear.
+    """
+    from tools import wake_word
+
+    config = {"enabled": True, "phrase": "hey hermes", "surface": "auto"}
+
+    monkeypatch.setattr(wake_word, "load_wake_word_config", lambda: dict(config))
+    monkeypatch.setattr(wake_word, "check_wake_word_requirements", lambda _cfg: {
+        "available": True,
+        "phrase": "hey hermes",
+        "provider": "openwakeword",
+        "hint": "",
+    })
+    monkeypatch.setattr(
+        wake_word,
+        "detect_system32_onnxruntime_shadow",
+        lambda: "Windows System32 onnxruntime shadowing detected",
+    )
+
+    def boom(*_a, **_kw):
+        raise OSError("[WinError 1114] DLL initialization routine failed")
+
+    monkeypatch.setattr(wake_word, "start_listening", boom)
+    monkeypatch.setattr(wake_word, "owns_listener", lambda owner: False)
+
+    transport = types.SimpleNamespace(_closed=False)
+    server._wake_owner_transport = None
+    server._wake_owner_surface = ""
+    try:
+        response = server.dispatch({
+            "id": "wake-fail",
+            "method": "wake.start",
+            "params": {"surface": "gui"},
+        }, transport=transport)
+
+        assert response.get("error") is None, "must not be a JSON-RPC error"
+        result = response["result"]
+        assert result["started"] is False
+        assert result["reason"] == "start_failed"
+        assert "WinError 1114" in result["error"]
+        assert "System32" in result["hint"]
+        # State must remain free so the user can retry after fixing the env.
+        assert server._wake_owner_transport is None
+        assert server._wake_owner_surface == ""
+    finally:
+        server._wake_owner_transport = None
+        server._wake_owner_surface = ""
+
+
 def test_wake_status_reports_configured_input_device_and_windows_silence_hint(monkeypatch):
     from tools import wake_word
 

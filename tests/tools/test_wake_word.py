@@ -22,6 +22,43 @@ import tools.wake_word as ww
 # ── Config helpers ───────────────────────────────────────────────────────
 
 
+def test_detect_system32_onnxruntime_shadow_returns_none_off_windows(monkeypatch):
+    """#76296: non-Windows hosts must report no shadow, no IO."""
+    monkeypatch.setattr(ww.sys, "platform", "linux")
+    assert ww.detect_system32_onnxruntime_shadow() is None
+    monkeypatch.setattr(ww.sys, "platform", "darwin")
+    assert ww.detect_system32_onnxruntime_shadow() is None
+
+
+def test_detect_system32_onnxruntime_shadow_hints_on_present_file(monkeypatch):
+    """#76296: when System32's onnxruntime.dll is present, return the hint."""
+    monkeypatch.setattr(ww.sys, "platform", "win32")
+    monkeypatch.setattr(ww.os.path, "isfile", lambda p: p == ww._WIN_SYSTEM32_ONNXRUNTIME)
+    ww._warned_system32_onnx_shadow = False
+    try:
+        hint = ww.detect_system32_onnxruntime_shadow()
+    finally:
+        ww._warned_system32_onnx_shadow = False
+    assert hint is not None
+    assert "System32" in hint
+    assert "onnxruntime" in hint
+
+
+def test_detect_system32_onnxruntime_shadow_idempotent_warning(monkeypatch):
+    """#76296: log the warning exactly once even when called repeatedly."""
+    monkeypatch.setattr(ww.sys, "platform", "win32")
+    monkeypatch.setattr(ww.os.path, "isfile", lambda p: True)
+    warnings = []
+    monkeypatch.setattr(ww.logger, "warning", lambda *a, **kw: warnings.append(a))
+    ww._warned_system32_onnx_shadow = False
+    try:
+        ww.detect_system32_onnxruntime_shadow()
+        ww.detect_system32_onnxruntime_shadow()
+    finally:
+        ww._warned_system32_onnx_shadow = False
+    assert len(warnings) == 1
+
+
 def test_config_defaults_and_clamping():
     assert ww._provider({}) == "openwakeword"
     assert ww._provider({"provider": "Porcupine"}) == "porcupine"
@@ -107,6 +144,22 @@ def test_requirements_openwakeword_available(monkeypatch):
     assert r["available"] is True
     assert r["provider"] == "openwakeword"
     assert r["phrase"] == "hey hermes"
+
+
+def test_requirements_surfaces_system32_shadow_hint(monkeypatch):
+    """#76296: System32's onnxruntime.dll shadow must surface as the hint
+    when deps and audio are otherwise fine — that's the silent-failure mode
+    the issue describes."""
+    _voice_loop_ready(monkeypatch)
+    monkeypatch.setattr(ww, "_audio_available", lambda: True)
+    monkeypatch.setattr("tools.lazy_deps.is_available", lambda f: True)
+    monkeypatch.setattr(
+        ww,
+        "detect_system32_onnxruntime_shadow",
+        lambda: "System32 onnxruntime shadow breaks the wheel",
+    )
+    r = ww.check_wake_word_requirements({"provider": "openwakeword"})
+    assert r["hint"] == "System32 onnxruntime shadow breaks the wheel"
 
 
 def test_tts_ready_is_a_probe_never_an_installer(monkeypatch):
