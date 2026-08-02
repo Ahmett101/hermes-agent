@@ -272,14 +272,124 @@ def _permitted_host_read_target(p: Path, ctx: ResolveContext) -> Optional[Path]:
 
 
 def _get_active_env(task_id: Optional[str]):
-    if not task_id:
-        return None
+    """Return the active sandbox env, creating it on demand under Docker.
+
+    Wraps ``tools.terminal_tool.get_active_env`` (lookup-only) with the
+    same lazy-create pattern ``tools.code_execution_tool._get_or_create_env``
+    uses: a per-task lock guards environment creation, so a vision call
+    that fires before any terminal/file-tool request still gets a working
+    executor instead of "no active sandbox session". On a local backend
+    (or when creation fails) returns ``None`` and the caller fails closed.
+
+    Note: ``tools/terminal_tool.get_active_env`` is lookup-only; without
+    this lazy wrapper the first vision_analyze on a fresh process hits
+    "no active sandbox session" while a retry sees the env (which some
+    earlier tool already created) and succeeds — the #76566 symptom.
+    """
     try:
         from tools.terminal_tool import get_active_env
-
-        return get_active_env(task_id)
     except Exception:
         return None
+    if not task_id:
+        return get_active_env(task_id) if task_id else None
+    existing = get_active_env(task_id)
+    if existing is not None:
+        return existing
+    # Lazy creation path. Re-use the same lock+double-check that
+    # tools.code_execution_tool._get_or_create_env uses, so we share one
+    # environment per task_id across all tools that need it.
+    try:
+        import threading
+        import time
+        from tools.terminal_tool import (
+            _active_environments, _creation_locks, _creation_locks_lock,
+            _create_environment, _env_lock, _get_env_config, _last_activity,
+            _resolve_container_task_id, _start_cleanup_thread,
+            _task_env_overrides,
+        )
+    except Exception:
+        return None
+
+    effective_task_id = _resolve_container_task_id(task_id)
+
+    # Fast path under lock — env may have appeared while we were importing.
+    with _env_lock:
+        cached = _active_environments.get(effective_task_id) or _active_environments.get(task_id)
+        if cached is not None:
+            _last_activity[effective_task_id] = time.time()
+            return cached
+
+    # Slow path: per-task creation lock so concurrent first-uses share one env.
+    with _creation_locks_lock:
+        per_task = _creation_locks.setdefault(effective_task_id, threading.Lock())
+    with per_task:
+        # Double-check inside the per-task lock.
+        with _env_lock:
+            cached = _active_environments.get(effective_task_id) or _active_environments.get(task_id)
+            if cached is not None:
+                _last_activity[effective_task_id] = time.time()
+                return cached
+
+        try:
+            config = _get_env_config()
+            env_type = config["env_type"]
+        except Exception:
+            return None
+        # Fail-closed: only docker / ssh / container-style backends can
+        # materialize a sandbox on demand. Local backend has nothing to
+        # acquire, so return None and let the caller fail closed.
+        if env_type not in {"docker", "singularity", "modal", "daytona", "vercel_sandbox", "ssh"}:
+            return None
+
+        overrides = _task_env_overrides.get(effective_task_id, {})
+        image = overrides.get(f"{env_type}_image") or config.get(f"{env_type}_image", "")
+        cwd = overrides.get("cwd") or config.get("cwd", "")
+
+        container_config = None
+        if env_type in {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}:
+            container_config = {
+                "container_cpu": config.get("container_cpu", 1),
+                "container_memory": config.get("container_memory", 5120),
+                "container_disk": config.get("container_disk", 51200),
+                "container_persistent": config.get("container_persistent", True),
+                "vercel_runtime": config.get("vercel_runtime", ""),
+                "docker_volumes": config.get("docker_volumes", []),
+                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
+                "docker_network": config.get("docker_network", True),
+            }
+        ssh_config = None
+        if env_type == "ssh":
+            ssh_config = {
+                "host": config.get("ssh_host", ""),
+                "user": config.get("ssh_user", ""),
+                "port": config.get("ssh_port", 22),
+                "key": config.get("ssh_key", ""),
+                "persistent": config.get("ssh_persistent", False),
+            }
+
+        try:
+            env = _create_environment(
+                env_type=env_type,
+                image=image,
+                cwd=cwd,
+                timeout=config.get("timeout", 120),
+                ssh_config=ssh_config,
+                container_config=container_config,
+                local_config=None,
+                task_id=effective_task_id,
+                host_cwd=config.get("host_cwd") or "",
+            )
+        except Exception:
+            return None
+
+        with _env_lock:
+            _active_environments[effective_task_id] = env
+            _last_activity[effective_task_id] = time.time()
+        try:
+            _start_cleanup_thread()
+        except Exception:
+            pass
+        return env
 
 
 async def _resolve_container_fallback(
@@ -297,11 +407,22 @@ async def _resolve_container_fallback(
     Fail-closed: if there is no active sandbox env we refuse rather than falling
     back to a host read, so a non-cache host path under a sandbox never leaks.
 
-    Cold-start retry: under Docker the very first exec against a freshly
-    started container can fail (empty pipe / partial setup) while an identical
-    second call succeeds. We retry once with a short delay before giving up,
-    so callers don't see "could not read inside the sandbox" on a file that is
-    verifiably readable on the immediate retry. See #76566.
+    Laziness: ``_get_active_env`` now lazy-creates the env when none is active
+    for the task — the same synchronized pattern ``_get_or_create_env`` in
+    ``tools.code_execution_tool`` uses (per-task lock + double-check). The
+    #76566 report ("first call fails, retry succeeds") is exactly a first-use
+    miss: ``get_active_env`` is lookup-only, so the first vision call on a
+    fresh process raises "no active sandbox session" while a later call sees
+    the env another tool created. Lazy acquisition closes that gap without
+    weakening confinement: only docker / ssh / container-style backends
+    materialize a sandbox on demand; the local backend returns None and
+    fails closed.
+
+    Cold-start retry: even with the env acquired, the very first exec against
+    a freshly started container can come back empty/non-zero while an
+    immediate retry settles and reads cleanly. We retry once with a short
+    delay before giving up (150ms covers Docker exec warm-up without making
+    a real failure feel sluggish).
 
     Diagnostic: when every attempt fails, the container's own output (stderr
     + stdout) is folded into the raised error so the user can distinguish

@@ -228,6 +228,7 @@ class TestExecReadSafety:
         def fake_execute(cmd, **kw):
             return {"returncode": 1, "output": ""}
 
+        # Existing test: env already present, exec fails.
         with patch("tools.image_source._get_active_env",
                    return_value=SimpleNamespace(execute=fake_execute)):
             with pytest.raises(isrc.SourceNotFound):
@@ -235,11 +236,138 @@ class TestExecReadSafety:
                     "/workspace/nope.png", isrc.ResolveContext(task_id="t1"))
 
     @pytest.mark.asyncio
+    async def test_lazy_env_acquisition_no_env_then_create(
+        self, tmp_path, monkeypatch
+    ):
+        """#76566: first call with NO active env (the reported fail path)
+        must lazy-create a sandbox env and succeed — the matcher Teknium
+        pointed at (tools/terminal_tool.get_active_env is lookup-only).
+        No patch on _get_active_env; we drive the real lazy-create path
+        by seeding an empty _active_environments and a stub
+        _create_environment that records the call."""
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+        import tools.terminal_tool as tt
+        import threading, time
+
+        b64 = base64.b64encode(PNG).decode()
+
+        class _StubEnv:
+            def __init__(self):
+                self._calls = 0
+            def execute(self, cmd, **kw):
+                self._calls += 1
+                return {"returncode": 0, "output": b64}
+
+        stub = _StubEnv()
+        created = []
+        # Start with EMPTY _active_environments — exactly the reported path.
+        monkeypatch.setattr(tt, "_active_environments", {})
+        monkeypatch.setattr(tt, "_creation_locks", {})
+        monkeypatch.setattr(tt, "_creation_locks_lock", threading.Lock())
+        monkeypatch.setattr(tt, "_env_lock", threading.Lock())
+        monkeypatch.setattr(tt, "_last_activity", {})
+        monkeypatch.setattr(tt, "_task_env_overrides", {})
+        monkeypatch.setattr(
+            tt, "_resolve_container_task_id", lambda tid: tid or "default"
+        )
+        monkeypatch.setattr(
+            tt, "_get_env_config",
+            lambda: {"env_type": "docker", "docker_image": "py:3.11",
+                     "cwd": "/workspace", "timeout": 60, "host_cwd": ""},
+        )
+        monkeypatch.setattr(
+            tt, "_create_environment",
+            lambda **kw: (created.append(kw), stub)[1],
+        )
+        started = []
+        monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: started.append(1))
+        monkeypatch.setattr(tt, "get_active_env", lambda tid: tt._active_environments.get(tid))
+
+        res = await isrc.resolve_image_source(
+            "/workspace/cold.png", isrc.ResolveContext(task_id="t1"))
+
+        # Lazy acquisition created exactly one env, called it once, succeeded.
+        assert len(created) == 1
+        assert created[0]["env_type"] == "docker"
+        assert created[0]["task_id"] == "t1"
+        assert stub._calls == 1
+        assert started == [1]
+        assert res.origin == "container"
+        assert res.data == PNG
+        # Env is now registered for the next caller (no more creation needed).
+        assert "t1" in tt._active_environments
+
+    @pytest.mark.asyncio
+    async def test_lazy_env_acquisition_local_backend_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        """#76566: under the LOCAL backend the path stays on the host —
+        nothing to acquire, no sandbox read. The resolver raises
+        SourceNotFound (no host file, nothing to fall back to), and that
+        message must NOT pretend the file is unreachable *inside the
+        sandbox* — there is no sandbox under a local backend."""
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "local")  # not docker
+
+        with pytest.raises(isrc.SourceNotFound) as excinfo:
+            await isrc.resolve_image_source(
+                "/workspace/x.png", isrc.ResolveContext(task_id="t1"))
+        # Local backend: "media file not found", NOT "inside the sandbox".
+        # The sandbox-unreachable message must only fire for non-local backends.
+        msg = str(excinfo.value)
+        assert "media file not found" in msg, msg
+        assert "inside the sandbox" not in msg, msg
+
+    @pytest.mark.asyncio
+    async def test_lazy_env_acquisition_create_failure_fails_closed(
+        self, tmp_path, monkeypatch
+    ):
+        """#76566: if _create_environment raises (daemon down, image pull
+        failure, ...), _get_active_env returns None and the caller fails
+        closed with the same fail-closed message — never an opaque
+        exception that leaks the create path."""
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+
+        import tools.terminal_tool as tt
+        import threading
+
+        monkeypatch.setattr(tt, "_active_environments", {})
+        monkeypatch.setattr(tt, "_creation_locks", {})
+        monkeypatch.setattr(tt, "_creation_locks_lock", threading.Lock())
+        monkeypatch.setattr(tt, "_env_lock", threading.Lock())
+        monkeypatch.setattr(tt, "_last_activity", {})
+        monkeypatch.setattr(tt, "_task_env_overrides", {})
+        monkeypatch.setattr(
+            tt, "_resolve_container_task_id", lambda tid: tid or "default"
+        )
+        monkeypatch.setattr(
+            tt, "_get_env_config",
+            lambda: {"env_type": "docker", "docker_image": "py:3.11",
+                     "cwd": "/workspace", "timeout": 60, "host_cwd": ""},
+        )
+        def _boom(**kw):
+            raise RuntimeError("daemon down")
+        monkeypatch.setattr(tt, "_create_environment", _boom)
+        monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
+        monkeypatch.setattr(tt, "get_active_env", lambda tid: tt._active_environments.get(tid))
+
+        with pytest.raises(isrc.SourceNotFound) as excinfo:
+            await isrc.resolve_image_source(
+                "/workspace/x.png", isrc.ResolveContext(task_id="t1"))
+        assert "not reachable inside the sandbox" in str(excinfo.value)
+
+    @pytest.mark.asyncio
     async def test_exec_read_retries_cold_start_then_succeeds(self, tmp_path, monkeypatch):
-        """#76566: under Docker, vision's first exec-read can fail (cold
-        container / pipe setup) and an identical retry succeeds. The
-        resolver must transparently retry before raising, so users don't
-        see 'could not read inside the sandbox' on a file that is fully
+        """#76566: even with the env acquired, the very first exec against
+        a fresh container can come back empty/non-zero while an immediate
+        retry succeeds. Keep the single retry so the agent doesn't see
+        'could not read inside the sandbox' on a file that is fully
         readable on the second attempt."""
         home = tmp_path / "hermes"
         isrc = _reload(monkeypatch, home)
@@ -251,7 +379,6 @@ class TestExecReadSafety:
         def fake_execute(cmd, **kw):
             calls["n"] += 1
             if calls["n"] == 1:
-                # First call: cold start — empty pipe, exit non-zero.
                 return {"returncode": 1, "output": ""}
             return {"returncode": 0, "output": b64}
 
@@ -264,12 +391,12 @@ class TestExecReadSafety:
         assert calls["n"] == 2
 
     @pytest.mark.asyncio
-    async def test_exec_read_retries_exhausted_includes_diagnostic(
+    async def test_exec_read_failure_includes_diagnostic(
         self, tmp_path, monkeypatch
     ):
-        """#76566: when every retry still fails, the error must carry the
-        container's stderr/stdout so the user can tell 'no such file'
-        from 'permission denied' from 'cold start never came up'."""
+        """#76566: when the exec read still fails after the retry, fold
+        the container's first stderr/stdout line into the raised error so
+        the user can tell 'no such file' from 'permission denied'."""
         home = tmp_path / "hermes"
         isrc = _reload(monkeypatch, home)
         monkeypatch.setenv("TERMINAL_ENV", "docker")
@@ -282,7 +409,6 @@ class TestExecReadSafety:
             with pytest.raises(isrc.SourceNotFound) as excinfo:
                 await isrc.resolve_image_source(
                     "/workspace/missing.png", isrc.ResolveContext(task_id="t1"))
-        # Diagnostic surfaced — the user can act on it.
         assert "No such file or directory" in str(excinfo.value)
 
 
