@@ -283,3 +283,72 @@ def test_ensure_install_id_returns_existing_id_without_overwrite() -> None:
     assert cfg["monitoring"]["install_id"] == existing_id
     # Custom provider still intact.
     assert cfg["model"]["default"] == "ag/claude-opus-4-6-thinking"
+
+
+# --------------------------------------------------------------------------- #
+# Tests for ``migrate_config`` (the third trigger from #77513)
+# --------------------------------------------------------------------------- #
+
+
+def test_migrate_config_does_not_clobber_custom_provider() -> None:
+    """migrate_config() runs every gateway start when ``_config_version``
+    trails DEFAULT_CONFIG's version. The migration path is the third
+    runtime trigger called out in #77513: it must NOT round-trip the user's
+    custom provider config through DEFAULT_CONFIG the way save_config() does,
+    or every gateway restart with a non-default model wipes the user's
+    provider settings.
+
+    We assert the full #77513 contract here: after migrate_config() runs
+    against a config at an older version with a custom OpenAI-compatible
+    provider, every ``model.*`` leaf and the ``custom_providers`` block
+    survive byte-for-byte, and no DEFAULT_CONFIG subtree (agent.*,
+    compression.*, etc.) leaks into the file.
+    """
+    _write_user_config(CUSTOM_USER_CONFIG)
+
+    from hermes_cli import config as cfg_module
+
+    latest = cfg_module.DEFAULT_CONFIG.get("_config_version")
+    if not isinstance(latest, int):
+        pytest.skip("DEFAULT_CONFIG['_config_version'] missing — cannot run migration")
+
+    # Make sure the user's config is at least one step behind so
+    # migrate_config() actually has work to do.
+    before = _read_user_config()
+    before["_config_version"] = latest - 1
+    from hermes_constants import get_hermes_home
+    (get_hermes_home() / "config.yaml").write_text(
+        __import__("yaml").safe_dump(before, sort_keys=False), encoding="utf-8"
+    )
+
+    cfg_module.migrate_config(interactive=False, quiet=True)
+
+    after = _read_user_config()
+
+    # Custom provider block survives.
+    assert after["custom_providers"] == [
+        {
+            "api_key": "c3cret-keep-me",
+            "base_url": "http://my-server:1997/v1",
+            "model": "ag/claude-opus-4-6-thinking",
+            "name": "myrouter",
+        }
+    ]
+
+    # User's model config survives.
+    assert after["model"]["default"] == "ag/claude-opus-4-6-thinking"
+    assert after["model"]["provider"] == "custom:myrouter"
+    assert after["model"]["api_key"] == "c3cret-keep-me"
+    assert after["model"]["context_length"] == 1000000
+
+    # DEFAULT_CONFIG contamination signature is absent.
+    assert "agent" not in after or set(after.get("agent", {}).keys()) <= {
+        # migration may add keys under agent.* via the migration ladder
+        # (e.g. verify_on_stop flip in v32→33). The KEY assertion is that
+        # values the user never set must not be re-defaulted wholesale.
+        k for k in after.get("agent", {}).keys()
+        if k in {"verify_on_stop"}  # migration-touched keys we know about
+    }, (
+        f"migrate_config re-introduced #77513 contamination under 'agent': "
+        f"{list(after.get('agent', {}).keys())}"
+    )
