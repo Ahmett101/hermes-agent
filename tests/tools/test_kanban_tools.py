@@ -1036,7 +1036,10 @@ def test_create_respects_auto_subscribe_on_create_false(
     # home to avoid mkdir() colliding with the worker's directory.
     home = tmp_path / "gate-home" / ".hermes"
     home.mkdir(parents=True)
-    (home / "config.yaml").write_text("kanban:\n  auto_subscribe_on_create: false\n")
+    (home / "config.yaml").write_text(
+        "kanban:\n  auto_subscribe_on_create: false\n",
+        encoding="utf-8",
+    )
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
