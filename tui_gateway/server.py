@@ -4654,18 +4654,12 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
     platform would carry their schema for nothing — so this resolver is the one
     gate that exposes them.
 
-    ``platform`` is the SESSION's source (``session.create``'s ``source``
-    field), never a process env var. The desktop app is a client: it can be
-    driving a local, SSH, URL, or cloud backend, and only the local/SSH spawn
-    paths run with ``HERMES_DESKTOP=1``. Keying GUI capability off that env var
-    silently stripped every pane/browser tool from URL and cloud gateways while
-    the same backend told the model it was "chatting inside the Hermes desktop
-    app". See the surface-capability rule in AGENTS.md.
+    ``desktop_ui`` is intentionally NOT added here: preview-pane tools are a
+    user-facing capability, so they are exposed as a configurable default-off
+    toolset instead of being silently granted to every desktop session. ``project``
+    remains a surface primitive because the GUI owns project navigation itself.
     """
-    surfaces = {"project"}
-    if platform == "desktop":
-        surfaces.add("desktop_ui")
-    return surfaces
+    return {"project"}
 
 
 def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
@@ -4690,10 +4684,9 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
 
             selection = coding_selection(platform=session_platform)
             if selection is not None:
-                # Fold in the client-surface toolsets here too: the focus-mode
-                # coding posture returns before the fallback path that normally
-                # adds them — without this the desktop loses its pane/project
-                # tools exactly when sitting in a repo (see below).
+                # Fold in non-configurable GUI primitives here too: the
+                # focus-mode coding posture returns before the fallback path
+                # that normally adds them.
                 return sorted({*selection, *_gui_surface_toolsets(session_platform)})
         except Exception:
             pass
@@ -4805,12 +4798,10 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
             print(fallback_notice, file=sys.stderr, flush=True)
         if not enabled:
             return None
-        # The client-surface toolsets are off _HERMES_CORE_TOOLS (every other
-        # platform would carry their schema for nothing), so the platform
+        # Non-configurable GUI primitives are off _HERMES_CORE_TOOLS (every
+        # other platform would carry their schema for nothing), so the platform
         # recovery above — which keys off hermes-cli's tool universe — can't
-        # surface them. This resolver runs ONLY in the desktop/TUI gateway, so
-        # folding them in here is the gate that exposes them on exactly the
-        # surface that can answer them.
+        # surface them.
         return sorted(enabled | _gui_surface_toolsets(session_platform))
     except Exception:
         if fallback_notice is not None:

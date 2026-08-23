@@ -61,9 +61,9 @@ class TestDesktopUiToolset:
 
 
 class TestSurfaceResolution:
-    def test_desktop_session_gets_them_with_no_desktop_env(self, no_desktop_env):
-        """THE regression: a desktop client on a remote/cloud backend."""
-        assert "desktop_ui" in server._gui_surface_toolsets("desktop")
+    def test_desktop_preview_tools_are_not_granted_by_surface(self, no_desktop_env):
+        """Preview tools are user opt-in, not automatic desktop affordances."""
+        assert "desktop_ui" not in server._gui_surface_toolsets("desktop")
 
     def test_tui_session_does_not(self, no_desktop_env):
         assert "desktop_ui" not in server._gui_surface_toolsets("tui")
@@ -89,11 +89,7 @@ class TestResolverPlumbing:
 
         no_desktop_env.setattr(cc, "coding_selection", lambda **_: ["coding"])
 
-        assert server._load_enabled_toolsets("desktop") == [
-            "coding",
-            "desktop_ui",
-            "project",
-        ]
+        assert server._load_enabled_toolsets("desktop") == ["coding", "project"]
         assert server._load_enabled_toolsets("tui") == ["coding", "project"]
 
     def test_config_path_folds_in_the_session_surface(self, no_desktop_env):
@@ -109,8 +105,24 @@ class TestResolverPlumbing:
         tui = server._load_enabled_toolsets("tui")
 
         assert desktop is not None and tui is not None
-        assert "desktop_ui" in desktop
+        assert "desktop_ui" not in desktop
         assert "desktop_ui" not in tui
+
+    def test_explicit_desktop_ui_opt_in_enables_preview_tools(self, no_desktop_env):
+        import agent.coding_context as cc
+        import hermes_cli.config as config_mod
+
+        no_desktop_env.setattr(cc, "coding_selection", lambda **_: None)
+        no_desktop_env.setattr(
+            config_mod,
+            "load_config",
+            lambda: {"platform_toolsets": {"cli": ["memory", "desktop_ui"]}},
+        )
+
+        desktop = server._load_enabled_toolsets("desktop")
+
+        assert desktop is not None
+        assert "desktop_ui" in desktop
 
     def test_explicit_env_pin_still_wins(self, no_desktop_env):
         """HERMES_TUI_TOOLSETS is an operator override; surface can't re-add."""
