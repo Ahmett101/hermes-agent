@@ -98,7 +98,8 @@ function load(turnScript = () => '(pass)') {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__ga = { sendToGroupChat, recordGroupActivity, currentGroupActivity, groupActivityLabel, updateGroupChat, $groupChats, $groupActivity, GROUP_ACTIVITY_LIMIT };\n'
+      '\nglobalThis.__ga = { sendToGroupChat, recordGroupActivity, currentGroupActivity, groupActivityLabel, updateGroupChat, $groupChats, $groupActivity, GROUP_ACTIVITY_LIMIT };\n',
+      'globalThis.__ga.groupActivityErrorDetail = groupActivityErrorDetail;\n'
     )
   vm.runInNewContext(source, context, { filename: 'plugin.js' })
   const storageWrites = new Map()
@@ -146,7 +147,7 @@ test('a settled turn records the full truthful arc: queued, working, replies and
 test('a failed member turn records failed instead of a phantom reply', async () => {
   const gc = load(profile => {
     if (profile === 'builder') {
-      throw new Error('gateway hiccup')
+      throw new Error('agent init failed: No usable credentials found')
     }
     return '(pass)'
   })
@@ -155,7 +156,21 @@ test('a failed member turn records failed instead of a phantom reply', async () 
   await drain(gc, 'Flaky')
 
   const events = feed(gc, 'Flaky')
-  assert.equal(events.some(e => e.kind === 'failed' && e.member === 'builder'), true)
+  const failed = events.find(e => e.kind === 'failed' && e.member === 'builder')
+  assert.ok(failed)
+  assert.equal(failed.error, 'agent init failed: No usable credentials found')
+  assert.equal(
+    gc.groupActivityLabel(failed),
+    'builder hit an error: agent init failed: No usable credentials found'
+  )
+})
+
+test('failed activity error details are single-line and bounded', () => {
+  const gc = load()
+  const detail = gc.groupActivityErrorDetail(new Error(`agent init failed:\n${'x'.repeat(300)}`))
+
+  assert.equal(detail.includes('\n'), false)
+  assert.equal(detail.length, 180)
 })
 
 test('a newer send interrupts the previous run and records cancelled in the CURRENT epoch', async () => {

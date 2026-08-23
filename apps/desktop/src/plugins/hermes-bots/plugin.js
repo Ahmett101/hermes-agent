@@ -321,7 +321,22 @@ function groupActivityLabel(event) {
 
   const who = event?.member === 'You' ? 'You' : groupSpeakerLabel(event?.member || 'A bot')
 
+  if (kind === 'failed' && event?.error) {
+    return `${who} ${base}: ${event.error}`
+  }
+
   return `${who} ${base}`
+}
+
+function groupActivityErrorDetail(err) {
+  const raw =
+    typeof err === 'string' ? err : (err && (err.message || err.error || err.reason)) || ''
+  return (
+    String(raw || 'Unknown error')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 180) || 'Unknown error'
+  )
 }
 
 const GROUP_ACTIVITY_LABELS = {
@@ -6087,8 +6102,13 @@ async function runGroupChatRounds(group, members, thread) {
 
         try {
           reply = await runGroupChatMemberTurn(group, member, prompt, thread, deltaImages)
-        } catch {
-          recordGroupActivity(group, { kind: 'failed', member: member.name, thread })
+        } catch (err) {
+          recordGroupActivity(group, {
+            kind: 'failed',
+            member: member.name,
+            thread,
+            error: groupActivityErrorDetail(err)
+          })
           reply = null // a failed turn is a pass, never a room error
         }
 
