@@ -1257,6 +1257,7 @@ class TelegramAdapter(BasePlatformAdapter):
         user = getattr(message, "from_user", None)
         chat = getattr(message, "chat", None)
         user_id = str(getattr(user, "id", "")).strip() or None
+        is_bot = bool(getattr(user, "is_bot", False)) if user is not None else False
         user_name = (
             str(getattr(user, "username", "") or getattr(user, "full_name", "") or "").strip()
             or None
@@ -1302,6 +1303,7 @@ class TelegramAdapter(BasePlatformAdapter):
             user_id=user_id,
             user_name=user_name,
             thread_id=thread_id,
+            is_bot=is_bot,
         )
 
     def _source_from_reaction_for_auth(self, update):
@@ -1424,6 +1426,16 @@ class TelegramAdapter(BasePlatformAdapter):
         # they carry no authorizable identity, so let the normal
         # _should_process_message gating handle them.
         if not user_id:
+            return True
+
+        # Match AuthzMixin's bot-policy branch before the human allowlist.
+        # In multiplex mode the profile-scoped message handler is a closure, so
+        # ``__self__`` is absent and the runner auth mixin may be unreachable at
+        # this early intake gate. Bot-authored Telegram messages must still obey
+        # TELEGRAM_ALLOW_BOTS=mentions/all instead of being treated as humans.
+        if getattr(source, "is_bot", False) and _scoped_gate_env(
+            "TELEGRAM_ALLOW_BOTS", "none"
+        ).lower().strip() in {"mentions", "all"}:
             return True
 
         authorized: Optional[bool] = None

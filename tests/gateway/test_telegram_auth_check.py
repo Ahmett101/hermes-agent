@@ -47,7 +47,9 @@ def _make_adapter(allow_from=None, allowed_chats=None, group_allowed_chats=None,
     return adapter
 
 
-def _make_message(text="hello", *, from_user_id=111, chat_id=-100, chat_type="group"):
+def _make_message(
+    text="hello", *, from_user_id=111, chat_id=-100, chat_type="group", is_bot=False
+):
     return SimpleNamespace(
         message_id=42,
         text=text,
@@ -57,7 +59,12 @@ def _make_message(text="hello", *, from_user_id=111, chat_id=-100, chat_type="gr
         message_thread_id=None,
         is_topic_message=False,
         chat=SimpleNamespace(id=chat_id, type=chat_type, title="Test", is_forum=False),
-        from_user=SimpleNamespace(id=from_user_id, full_name="Test User", first_name="Test"),
+        from_user=SimpleNamespace(
+            id=from_user_id,
+            full_name="Test User",
+            first_name="Test",
+            is_bot=is_bot,
+        ),
         reply_to_message=None,
         date=None,
         location=None,
@@ -370,3 +377,31 @@ def test_multiplex_closure_handler_without_callback_falls_back_to_env(monkeypatc
     assert adapter._is_user_authorized_from_message(
         _make_message(from_user_id=555, chat_id=-100123, chat_type="group")
     ) is False
+
+
+def test_bot_authored_message_allowed_under_multiplex_closure_handler(monkeypatch):
+    """TELEGRAM_ALLOW_BOTS must survive the multiplex closure handler shape."""
+    monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "mentions")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+
+    adapter = _make_adapter()
+    adapter._message_handler = lambda event: None  # closure, no __self__
+    assert getattr(adapter._message_handler, "__self__", None) is None
+
+    msg = _make_message(from_user_id=999, chat_id=-100123, chat_type="group", is_bot=True)
+
+    assert adapter._source_from_message_for_auth(msg).is_bot is True
+    assert adapter._is_user_authorized_from_message(msg) is True
+
+
+def test_allow_bots_does_not_authorize_human_under_multiplex_closure(monkeypatch):
+    """Bot policy is not a human allowlist bypass."""
+    monkeypatch.setenv("TELEGRAM_ALLOW_BOTS", "all")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111")
+
+    adapter = _make_adapter()
+    adapter._message_handler = lambda event: None  # closure, no __self__
+    msg = _make_message(from_user_id=999, chat_id=-100123, chat_type="group", is_bot=False)
+
+    assert adapter._source_from_message_for_auth(msg).is_bot is False
+    assert adapter._is_user_authorized_from_message(msg) is False
