@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import agent.display as display_module
 from agent.display import (
+    KawaiiSpinner,
     build_tool_preview,
     capture_local_edit_snapshot,
     extract_edit_diff,
@@ -15,6 +16,7 @@ from agent.display import (
     set_tool_preview_max_len,
     _render_inline_unified_diff,
     _summarize_rendered_diff_sections,
+    _terminal_cell_width,
     render_edit_diff_with_delta,
 )
 
@@ -35,6 +37,27 @@ def test_cute_tool_message_falls_back_when_renderer_raises(monkeypatch):
     assert get_cute_tool_message("web_extract", {"urls": []}, 0.25) == (
         "┊ ⚡ web_extra completed  0.2s"
     )
+
+
+def test_kawaii_spinner_clamps_long_frame_before_terminal_wrap(monkeypatch):
+    spinner = KawaiiSpinner(
+        'Running head -5 "C:/Users/Leo/.hermes/profiles/dfs-lead/skills/software/example.md"'
+    )
+    monkeypatch.setattr(spinner, "_terminal_columns", lambda: 40)
+
+    line = spinner._clamp_spinner_line(f"  ⠋ {spinner.message} (0.1s)")
+
+    assert _terminal_cell_width(line) <= 39
+    assert "\n" not in line
+
+
+def test_kawaii_spinner_clamp_respects_wide_char_cells(monkeypatch):
+    spinner = KawaiiSpinner("你" * 40)
+    monkeypatch.setattr(spinner, "_terminal_columns", lambda: 12)
+
+    line = spinner._clamp_spinner_line(f"  ⠋ {spinner.message} (0.1s)")
+
+    assert _terminal_cell_width(line) <= 11
 
 
 class TestBuildToolPreview:

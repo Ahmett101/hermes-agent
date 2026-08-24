@@ -7,9 +7,11 @@ Used by AIAgent._execute_tool_calls for CLI feedback.
 import logging
 import os
 import re
+import shutil
 import sys
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from difflib import unified_diff
 from pathlib import Path
@@ -27,6 +29,34 @@ _RESET = "\033[0m"
 logger = logging.getLogger(__name__)
 
 _ANSI_RESET = "\033[0m"
+
+
+def _terminal_cell_width(text: str) -> int:
+    """Return the approximate terminal cell width of ``text``."""
+    width = 0
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+    return width
+
+
+def _truncate_to_terminal_cells(text: str, max_columns: int) -> str:
+    """Clip ``text`` so it cannot enter the terminal autowrap column."""
+    if max_columns <= 0:
+        return ""
+    used = 0
+    out: list[str] = []
+    for char in text:
+        if unicodedata.combining(char):
+            char_width = 0
+        else:
+            char_width = 2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1
+        if used + char_width > max_columns:
+            break
+        out.append(char)
+        used += char_width
+    return "".join(out)
 
 
 def _display_url(value: Any) -> str:
@@ -1210,6 +1240,26 @@ class KawaiiSpinner:
         except ImportError:
             return False
 
+    def _terminal_columns(self) -> int:
+        """Return the captured output stream's terminal width, falling back safely."""
+        try:
+            if hasattr(self._out, "fileno"):
+                return max(1, os.get_terminal_size(self._out.fileno()).columns)
+        except (OSError, ValueError):
+            pass
+        try:
+            return max(1, shutil.get_terminal_size((80, 20)).columns)
+        except (OSError, ValueError):
+            return 80
+
+    def _clamp_spinner_line(self, line: str) -> str:
+        """Clip a spinner frame before the terminal autowrap column."""
+        # Avoid the final column: writing there can trigger autowrap on Windows
+        # consoles, and \r then returns to the wrapped continuation line instead
+        # of the original spinner row.
+        max_columns = max(1, self._terminal_columns() - 1)
+        return _truncate_to_terminal_cells(line, max_columns)
+
     def _animate(self):
         # When stdout is not a real terminal (e.g. Docker, systemd, pipe),
         # skip the animation entirely — it creates massive log bloat.
@@ -1245,9 +1295,11 @@ class KawaiiSpinner:
                 line = f"  {left} {frame} {self.message} {right} ({elapsed:.1f}s)"
             else:
                 line = f"  {frame} {self.message} ({elapsed:.1f}s)"
-            pad = max(self.last_line_len - len(line), 0)
+            line = self._clamp_spinner_line(line)
+            line_width = _terminal_cell_width(line)
+            pad = max(self.last_line_len - line_width, 0)
             self._write(f"\r{line}{' ' * pad}", end='', flush=True)
-            self.last_line_len = len(line)
+            self.last_line_len = line_width
             self.frame_idx += 1
             time.sleep(0.12)
 
