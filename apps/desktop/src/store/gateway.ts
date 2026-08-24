@@ -100,6 +100,7 @@ const ACTIVATION_LEASE_MS = 30_000
 interface GatewayRegistryState {
   config: RegistryConfig | null
   primaryGateway: HermesGateway | null
+  primaryConnectionId: null | string
   primaryProfile: string
   activeKey: string
   activationEpoch: number
@@ -114,6 +115,7 @@ function createRegistryState(): GatewayRegistryState {
   return {
     config: null,
     primaryGateway: null,
+    primaryConnectionId: null,
     primaryProfile: 'default',
     activeKey: 'default',
     activationEpoch: 0,
@@ -187,7 +189,20 @@ export function emitLocalGatewayEvent(event: GatewayEvent): void {
 
 export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'default'): void {
   g.primaryGateway = gateway
+  g.primaryConnectionId = null
   g.primaryProfile = normKey(profile)
+
+  if (g.activeKey === g.primaryProfile) {
+    setApiRequestConnection(null)
+  }
+}
+
+export function setPrimaryGatewayConnectionId(connectionId: null | string | undefined): void {
+  g.primaryConnectionId = (connectionId ?? '').trim() || null
+
+  if (g.activeKey === g.primaryProfile) {
+    setApiRequestConnection(g.primaryConnectionId)
+  }
 }
 
 export function isActivePrimary(): boolean {
@@ -222,7 +237,7 @@ export function activeGateway(): HermesGateway | null {
  */
 export function activeGatewayConnectionId(): null | string {
   if (g.activeKey === g.primaryProfile) {
-    return null
+    return g.primaryConnectionId
   }
 
   return g.secondaries.get(g.activeKey)?.connectionId ?? null

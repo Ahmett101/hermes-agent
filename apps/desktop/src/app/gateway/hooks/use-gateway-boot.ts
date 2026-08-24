@@ -17,6 +17,7 @@ import {
 } from '@/store/boot'
 import {
   $gateway,
+  activeGatewayConnectionId,
   closeSecondaryGateways,
   configureGatewayRegistry,
   disposeSecondariesForConnection,
@@ -28,6 +29,7 @@ import {
   reconnectSecondaryGateways,
   reportPrimaryGatewayState,
   setPrimaryGateway,
+  setPrimaryGatewayConnectionId,
   touchSecondaryGateways
 } from '@/store/gateway'
 import { registerGatewayReconnect } from '@/store/gateway-reconnect'
@@ -181,6 +183,7 @@ export function useGatewayBoot({
     const publish = (next: HermesConnection | null) => {
       callbacksRef.current.onConnectionReady(next)
       setConnection(next)
+      setPrimaryGatewayConnectionId(next?.connectionId)
     }
 
     if (!desktop) {
@@ -668,9 +671,17 @@ export function useGatewayBoot({
 
     const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
 
-    const offEvent = gateway.onEvent(event =>
-      callbacksRef.current.handleGatewayEvent({ ...event, profile: sourceProfile })
-    )
+    const offEvent = gateway.onEvent(event => {
+      const connectionId = activeGatewayConnectionId()
+      const scopedEvent = {
+        ...event,
+        profile: sourceProfile,
+        ...(connectionId ? { connectionId } : {})
+      }
+
+      recordSessionEventScope(scopedEvent)
+      callbacksRef.current.handleGatewayEvent(scopedEvent)
+    })
 
     // Wake signals: power resume (macOS/Windows), network coming back, and the
     // window regaining focus/visibility. Each nudges an immediate reconnect.
