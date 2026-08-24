@@ -1,6 +1,10 @@
 """Regression tests for Desktop-owned ``hermes serve`` lifecycle tracking."""
 
-from hermes_cli.web_server import _is_serve_orphaned, _valid_parent_start_marker
+from hermes_cli.web_server import (
+    _is_serve_orphaned,
+    _parent_start_marker_mismatch_is_conclusive,
+    _valid_parent_start_marker,
+)
 
 
 def test_parent_watchdog_tracks_recorded_desktop_pid_not_immediate_ppid():
@@ -56,4 +60,35 @@ def test_parent_watchdog_preserves_legacy_exact_windows_marker():
             process_start_marker=lambda _pid: marker,
         )
         is False
+    )
+
+
+def test_parent_watchdog_treats_ps_marker_mismatch_as_inconclusive():
+    """macOS ps lstart formatting drift must not kill a healthy backend."""
+
+    assert _parent_start_marker_mismatch_is_conclusive(
+        "ps:Mon Aug 24 14:30:30 2026",
+        "ps:Mon  Aug 24 14:30:30 2026",
+    ) is False
+    assert (
+        _is_serve_orphaned(
+            4242,
+            "ps:Mon Aug 24 14:30:30 2026",
+            process_start_marker=lambda _pid: "ps:Mon  Aug 24 14:30:30 2026",
+        )
+        is False
+    )
+
+
+def test_parent_watchdog_keeps_machine_marker_mismatches_conclusive():
+    """Linux/Windows machine markers still protect against PID reuse."""
+
+    assert _parent_start_marker_mismatch_is_conclusive("linux:123", "linux:456") is True
+    assert (
+        _is_serve_orphaned(
+            4242,
+            "linux:123",
+            process_start_marker=lambda _pid: "linux:456",
+        )
+        is True
     )
