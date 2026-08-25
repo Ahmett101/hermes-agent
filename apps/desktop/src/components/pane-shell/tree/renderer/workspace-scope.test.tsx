@@ -117,6 +117,25 @@ describe('TreeGroup workspace scope', () => {
     expect(visibleTabs()).toEqual(['bot-a', 'preview-tile:url:browser'])
   })
 
+  it('keeps a recovery chip for a lone scope-filtered edge split', () => {
+    vi.stubGlobal('CSS', { escape: (value: string) => value })
+    register('bot-a', 'Bot A', { workspaceMode: 'bots', workspaceOwnerKey: 'connection-a::default' })
+
+    const node: GroupNode = {
+      active: 'bot-a',
+      id: 'workspace-scope-zone',
+      panes: ['bot-a'],
+      type: 'group'
+    }
+
+    act(() => setWorkspaceScope('sessions'))
+    render(<TreeGroup node={node} parentAxis="column" />)
+
+    expect(visibleTabs()).toEqual(['bot-a'])
+    expect(container?.textContent).toContain('Bot A')
+    expect(container?.textContent).not.toContain('Bot A content')
+  })
+
   it('hides a Sessions-only Browser pane in Bot Mode', () => {
     vi.stubGlobal('CSS', { escape: (value: string) => value })
     register('bot-a', 'Bot A', { workspaceMode: 'bots', workspaceOwnerKey: 'connection-a::default' })

@@ -254,18 +254,24 @@ export function TreeGroup({
   // shown one (render-side — the tree keeps `active`).
   // Edit mode forces toggle-hidden panes visible so they can be rearranged
   // (mirrors tree-split's paneGone) — restores itself on exit.
+  const paneRegisteredAndAvailable = (id: string) =>
+    Boolean(paneFor(id)) && (editMode || !hiddenPanes.has(id)) && !(narrow && paneChrome(paneFor(id)).collapsible)
+
   const paneShown = (id: string) =>
-    Boolean(paneFor(id)) &&
-    contributesToWorkspace(paneFor(id), workspaceMode, workspaceOwnerKey) &&
-    (editMode || !hiddenPanes.has(id)) &&
-    !(narrow && paneChrome(paneFor(id)).collapsible)
+    paneRegisteredAndAvailable(id) && contributesToWorkspace(paneFor(id), workspaceMode, workspaceOwnerKey)
 
   const shown = node.panes.filter(paneShown)
+  // A lone edge-split bot/session pane can be scope-filtered out while the
+  // group itself still occupies a root workspace slot. Keep its chip reachable
+  // so Close/drag/menu affordances survive; the pane content remains hidden.
+  const recoverableHidden = shown.length === 0 ? node.panes.filter(id => paneRegisteredAndAvailable(id)) : []
+  const tabIds = shown.length > 0 ? shown : recoverableHidden
   const memoryKey = workspaceScopeKey(workspaceMode, workspaceOwnerKey)
 
   const activeId = shown.includes(node.active)
     ? node.active
     : (resolveRememberedActivePane(memoryKey, shown) ?? shown[0] ?? '')
+  const tabActiveId = tabIds.includes(node.active) ? node.active : (tabIds[0] ?? '')
 
   const active = paneFor(activeId)
   const isEmpty = shown.length === 0
@@ -318,12 +324,13 @@ export function TreeGroup({
   // it is the resolver's call, not this component's — see strip-visibility.ts
   // for the precedence. The same resolver answers for the toggle command, so
   // the keystroke and the screen always agree about which way "toggle" points.
+  const activeTabId = shown.length > 0 ? activeId : tabActiveId
   const stripVisible = tabStripVisibleForZone({
-    active: activeId,
+    active: activeTabId,
     isCollapsePane,
     mode: node.tabStrip,
     paneFor,
-    shown
+    shown: tabIds
   })
 
   // A group collapses ALONG its parent split's axis. In a row that means the
@@ -333,15 +340,15 @@ export function TreeGroup({
   // header IS the collapsed form, exactly as before.
   const verticalCollapse = Boolean(node.minimized) && parentAxis === 'row' && !isEmpty
   // A minimized group IS its header, so it shows one regardless.
-  const headerVisible = !isEmpty && !verticalCollapse && (Boolean(node.minimized) || stripVisible)
+  const headerVisible = tabIds.length > 0 && !verticalCollapse && (Boolean(node.minimized) || stripVisible)
 
   // Keep the activated tab — and, on the last one, the trailing "+" — inside
   // the strip's scroll window. Opening a tab past the right edge otherwise
   // left both the new tab and the button that made it out of view.
-  useActiveTabVisible(tabsRef, activeId, {
+  useActiveTabVisible(tabsRef, activeTabId, {
     enabled: headerVisible,
-    last: shown[shown.length - 1] === activeId,
-    tabCount: shown.length
+    last: tabIds[tabIds.length - 1] === activeTabId,
+    tabCount: tabIds.length
   })
 
   // Zone-menu close targets read the layout tree, but this component must NOT
@@ -352,7 +359,7 @@ export function TreeGroup({
   // (measured: TreeGroup 180 renders cascading into ChatView/Thread/TileChat
   // at ~4.5s each, holding the drag at ~3fps). The menu's items are resolved
   // when it OPENS, so they read the tree with `.get()` at that moment instead.
-  const targetPane = () => menuPane ?? activeId
+  const targetPane = () => menuPane ?? activeTabId
 
   // Close targets the right-clicked chip (falling back to the active pane);
   // panes that declare `uncloseable` (the main workspace) or `hideOnly`
@@ -366,7 +373,7 @@ export function TreeGroup({
 
   // The zone hosting the uncloseable workspace never minimizes — collapsing
   // MAIN strands the whole app behind a strip.
-  const minimizable = !shown.some(id => paneChrome(paneFor(id)).uncloseable)
+  const minimizable = shown.length > 0 && !shown.some(id => paneChrome(paneFor(id)).uncloseable)
 
   // Middle-click / ⌘-click on a tab: one routing for every tab kind, the same
   // one the zone menu's Close and ⌘W use.
@@ -482,7 +489,13 @@ export function TreeGroup({
               // moves the pane. No double-tap hide belongs here: hiding the
               // strip unmounts every affordance the zone has, including the
               // menu offering "Show", so it stays a named command.
-              startPaneDrag(activeId, e, () => minimizable && toggleCollapse(), undefined, active?.title ?? activeId)
+              startPaneDrag(
+                activeTabId,
+                e,
+                () => minimizable && toggleCollapse(),
+                undefined,
+                (shown.length > 0 ? active?.title : paneFor(activeTabId)?.title) ?? activeTabId
+              )
             }
             ref={stripRef}
             style={{ cursor: 'grab' }}
@@ -503,8 +516,8 @@ export function TreeGroup({
               </>
             }
           >
-            {shown.map(paneId => {
-              const isActive = paneId === activeId && !node.minimized
+            {tabIds.map(paneId => {
+              const isActive = paneId === activeTabId && !node.minimized
               const chrome = paneChrome(paneFor(paneId))
               const closeable = closeableTab(paneId)
               const title = paneFor(paneId)?.title ?? paneId
@@ -527,7 +540,7 @@ export function TreeGroup({
                     if (e.button === 0 && e.shiftKey) {
                       e.preventDefault()
                       e.stopPropagation()
-                      selectTabRange(node.id, shown, paneId, activeId)
+                      selectTabRange(node.id, tabIds, paneId, activeTabId)
 
                       return
                     }
@@ -535,7 +548,7 @@ export function TreeGroup({
                     if (isToggleSelectClick(e)) {
                       e.preventDefault()
                       e.stopPropagation()
-                      toggleTabSelected(node.id, paneId, activeId)
+                      toggleTabSelected(node.id, paneId, activeTabId)
 
                       return
                     }
@@ -552,7 +565,9 @@ export function TreeGroup({
                         restoreTreePane(paneId)
                       }
 
-                      activateTreePane(node.id, paneId)
+                      if (shown.length > 0) {
+                        activateTreePane(node.id, paneId)
+                      }
                     }
 
                     // Claim the press so the STRIP's own pane-drag handler
@@ -568,7 +583,7 @@ export function TreeGroup({
                     // one block through the generic pane move — a multi-tab
                     // drag outranks the pane's own tab drag (the session drop
                     // language is single-session).
-                    const dragSelection = selectionFor(node.id, shown, paneId)
+                    const dragSelection = selectionFor(node.id, tabIds, paneId)
 
                     if (dragSelection) {
                       startPaneDrag(
