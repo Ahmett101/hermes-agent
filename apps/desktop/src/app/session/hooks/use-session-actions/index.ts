@@ -200,6 +200,39 @@ interface SessionActionsOptions {
 // (NOT in this set) still legitimately drops to a draft.
 const createdThisRun = new Set<string>()
 
+interface BranchCreateFlight {
+  promise: Promise<SessionCreateResponse>
+  response?: SessionCreateResponse
+}
+
+const branchMessagesFingerprint = (messages: BranchMessage[]): string =>
+  JSON.stringify(messages.map(({ content, role }) => [role, content]))
+
+function branchCreateKey({
+  branchCount,
+  branchMessages,
+  cwd,
+  parentStoredId,
+  profile,
+  sourceSessionId
+}: {
+  branchCount?: number
+  branchMessages: BranchMessage[]
+  cwd?: string
+  parentStoredId: null | string
+  profile?: null | string
+  sourceSessionId: null | string
+}): string {
+  return JSON.stringify({
+    branchCount: branchCount ?? null,
+    cwd: cwd?.trim() || null,
+    messages: sourceSessionId ? null : branchMessagesFingerprint(branchMessages),
+    parentStoredId,
+    profile: profile?.trim() || null,
+    sourceSessionId
+  })
+}
+
 // Reflect a stored row's persisted token counts into the live usage atom
 // (total is derived, so callers can't drift it out of sync with input/output).
 function applyStoredUsage(stored: { input_tokens?: number | null; output_tokens?: number | null }) {
@@ -332,6 +365,7 @@ export function useSessionActions({
   const { t } = useI18n()
   const copy = t.desktop
   const resumeRequestRef = useRef(0)
+  const branchCreateFlightsRef = useRef(new Map<string, BranchCreateFlight>())
 
   // Follow auto-compression's stored-id rotation only while the exact runtime,
   // selection, and route intent still belong to the rotating conversation.
@@ -1955,20 +1989,53 @@ export function useSessionActions({
         // upsertOptimisticSession's $activeGatewayProfile stamp correct.
         await ensureGatewayProfile(profile)
 
+        const createKey = branchCreateKey({
+          branchCount,
+          branchMessages,
+          cwd,
+          parentStoredId,
+          profile,
+          sourceSessionId
+        })
+
+        let createFlight = branchCreateFlightsRef.current.get(createKey)
+
         // No title: the backend auto-names the branch from its parent's lineage.
-        const branched = sourceSessionId
-          ? await requestGateway<SessionCreateResponse>('session.branch', {
-              session_id: sourceSessionId,
-              ...(branchCount !== undefined ? { count: branchCount } : {})
-            })
-          : await requestGateway<SessionCreateResponse>('session.create', {
-              cols: 96,
-              source: 'desktop',
-              ...(cwd && { cwd }),
-              ...(profile ? { profile } : {}),
-              messages: branchMessages.map(({ content, role }) => ({ content, role })),
-              ...(parentStoredId && { parent_session_id: parentStoredId })
-            })
+        if (!createFlight) {
+          const createPromise = sourceSessionId
+            ? requestGateway<SessionCreateResponse>('session.branch', {
+                session_id: sourceSessionId,
+                ...(branchCount !== undefined ? { count: branchCount } : {})
+              })
+            : requestGateway<SessionCreateResponse>('session.create', {
+                cols: 96,
+                source: 'desktop',
+                ...(cwd && { cwd }),
+                ...(profile ? { profile } : {}),
+                messages: branchMessages.map(({ content, role }) => ({ content, role })),
+                ...(parentStoredId && { parent_session_id: parentStoredId })
+              })
+
+          createFlight = {
+            promise: createPromise
+              .then(response => {
+                const current = branchCreateFlightsRef.current.get(createKey)
+
+                if (current) {
+                  current.response = response
+                }
+
+                return response
+              })
+              .catch(err => {
+                branchCreateFlightsRef.current.delete(createKey)
+                throw err
+              })
+          }
+          branchCreateFlightsRef.current.set(createKey, createFlight)
+        }
+
+        const branched = createFlight.response ?? (await createFlight.promise)
 
         const responseBranchMessages =
           sourceSessionId && branched.messages?.length ? toBranchMessages(toChatMessages(branched.messages)) : []
@@ -2028,6 +2095,7 @@ export function useSessionActions({
           revealTreePane(`session-tile:${routedSessionId}`)
         }
 
+        branchCreateFlightsRef.current.delete(createKey)
         broadcastSessionsChanged()
 
         return true
