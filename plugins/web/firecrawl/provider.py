@@ -245,9 +245,12 @@ def _is_tool_gateway_ready() -> bool:
     """
     import tools.web_tools as _wt
 
-    return _wt.resolve_managed_tool_gateway(
-        "firecrawl", token_reader=_wt._peek_nous_access_token
-    ) is not None
+    return (
+        _wt.resolve_managed_tool_gateway(
+            "firecrawl", token_reader=_wt._peek_nous_access_token
+        )
+        is not None
+    )
 
 
 def _has_direct_firecrawl_config() -> bool:
@@ -367,12 +370,14 @@ def _get_firecrawl_client() -> Any:
                 "Subscription web selection is stored but the tool gateway "
                 "is unavailable."
             )
-            raise ValueError(selection_error(
-                "web",
-                NOUS_MANAGED_PROVIDER,
-                "the Nous Tool Gateway is not available (not entitled or "
-                "unreachable)",
-            ))
+            raise ValueError(
+                selection_error(
+                    "web",
+                    NOUS_MANAGED_PROVIDER,
+                    "the Nous Tool Gateway is not available (not entitled or "
+                    "unreachable)",
+                )
+            )
         kwargs, client_config = managed
         client_mode = "sdk"
     elif selected is not None or selection_exists("web"):
@@ -384,11 +389,13 @@ def _get_firecrawl_client() -> Any:
                 "Firecrawl client initialization failed: direct Firecrawl "
                 "selected but FIRECRAWL_API_KEY/FIRECRAWL_API_URL is not set."
             )
-            raise ValueError(selection_error(
-                "web",
-                selected or "firecrawl",
-                "neither FIRECRAWL_API_KEY nor FIRECRAWL_API_URL is set",
-            ))
+            raise ValueError(
+                selection_error(
+                    "web",
+                    selected or "firecrawl",
+                    "neither FIRECRAWL_API_KEY nor FIRECRAWL_API_URL is set",
+                )
+            )
         client_mode, kwargs, client_config = direct_config
     elif direct_config is not None:
         client_mode, kwargs, client_config = direct_config
@@ -516,6 +523,20 @@ def _extract_scrape_payload(scrape_result: Any) -> Dict[str, Any]:
     return result_plain
 
 
+def _coerce_status_code(value: Any) -> Optional[int]:
+    """Return a numeric HTTP status code when Firecrawl metadata provides one."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Provider class
 # ---------------------------------------------------------------------------
@@ -577,9 +598,7 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
             # next-in-line failover on rate limits (default-on free tier).
             from plugins.web.keyless_mcp import search_with_failover
 
-            logger.info(
-                "Firecrawl keyless search: '%s' (limit=%d)", query, limit
-            )
+            logger.info("Firecrawl keyless search: '%s' (limit=%d)", query, limit)
             return search_with_failover("firecrawl", query, limit)
 
         logger.info("Firecrawl search: '%s' (limit=%d)", query, limit)
@@ -655,19 +674,17 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                     blocked["host"],
                     blocked["rule"],
                 )
-                results.append(
-                    {
-                        "url": url,
-                        "title": "",
-                        "content": "",
-                        "error": blocked["message"],
-                        "blocked_by_policy": {
-                            "host": blocked["host"],
-                            "rule": blocked["rule"],
-                            "source": blocked["source"],
-                        },
-                    }
-                )
+                results.append({
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "error": blocked["message"],
+                    "blocked_by_policy": {
+                        "host": blocked["host"],
+                        "rule": blocked["rule"],
+                        "source": blocked["source"],
+                    },
+                })
                 continue
 
             try:
@@ -683,17 +700,15 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                     )
                 except asyncio.TimeoutError:
                     logger.warning("Firecrawl scrape timed out for %s", url)
-                    results.append(
-                        {
-                            "url": url,
-                            "title": "",
-                            "content": "",
-                            "error": (
-                                "Scrape timed out after 60s — page may be too large "
-                                "or unresponsive. Try browser_navigate instead."
-                            ),
-                        }
-                    )
+                    results.append({
+                        "url": url,
+                        "title": "",
+                        "content": "",
+                        "error": (
+                            "Scrape timed out after 60s — page may be too large "
+                            "or unresponsive. Try browser_navigate instead."
+                        ),
+                    })
                     continue
 
                 scrape_payload = _extract_scrape_payload(scrape_result)
@@ -719,18 +734,15 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                         "Blocked redirected web_extract for unsafe final URL: %s",
                         final_url,
                     )
-                    results.append(
-                        {
-                            "url": final_url,
-                            "title": title,
-                            "content": "",
-                            "raw_content": "",
-                            "error": (
-                                "Blocked: URL targets a private or internal "
-                                "network address"
-                            ),
-                        }
-                    )
+                    results.append({
+                        "url": final_url,
+                        "title": title,
+                        "content": "",
+                        "raw_content": "",
+                        "error": (
+                            "Blocked: URL targets a private or internal network address"
+                        ),
+                    })
                     continue
 
                 # Re-check website-access policy after any redirect
@@ -741,20 +753,35 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                         final_blocked["host"],
                         final_blocked["rule"],
                     )
-                    results.append(
-                        {
-                            "url": final_url,
-                            "title": title,
-                            "content": "",
-                            "raw_content": "",
-                            "error": final_blocked["message"],
-                            "blocked_by_policy": {
-                                "host": final_blocked["host"],
-                                "rule": final_blocked["rule"],
-                                "source": final_blocked["source"],
-                            },
-                        }
-                    )
+                    results.append({
+                        "url": final_url,
+                        "title": title,
+                        "content": "",
+                        "raw_content": "",
+                        "error": final_blocked["message"],
+                        "blocked_by_policy": {
+                            "host": final_blocked["host"],
+                            "rule": final_blocked["rule"],
+                            "source": final_blocked["source"],
+                        },
+                    })
+                    continue
+
+                status_code = _coerce_status_code(metadata.get("statusCode"))
+                if status_code is not None and status_code >= 400:
+                    metadata_error = metadata.get("error")
+                    if isinstance(metadata_error, str) and metadata_error.strip():
+                        error_detail = f": {metadata_error.strip()}"
+                    else:
+                        error_detail = ""
+                    results.append({
+                        "url": final_url,
+                        "title": title,
+                        "content": "",
+                        "raw_content": "",
+                        "error": f"Firecrawl target returned HTTP {status_code}{error_detail}",
+                        "metadata": metadata,
+                    })
                     continue
 
                 # Choose markdown vs html according to the requested format
@@ -763,26 +790,22 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                 else:
                     chosen_content = content_html or content_markdown or ""
 
-                results.append(
-                    {
-                        "url": final_url,
-                        "title": title,
-                        "content": chosen_content,
-                        "raw_content": chosen_content,
-                        "metadata": metadata,
-                    }
-                )
+                results.append({
+                    "url": final_url,
+                    "title": title,
+                    "content": chosen_content,
+                    "raw_content": chosen_content,
+                    "metadata": metadata,
+                })
             except Exception as scrape_err:  # noqa: BLE001
                 logger.debug("Firecrawl scrape failed for %s: %s", url, scrape_err)
-                results.append(
-                    {
-                        "url": url,
-                        "title": "",
-                        "content": "",
-                        "raw_content": "",
-                        "error": str(scrape_err),
-                    }
-                )
+                results.append({
+                    "url": url,
+                    "title": "",
+                    "content": "",
+                    "raw_content": "",
+                    "error": str(scrape_err),
+                })
 
         return results
 
