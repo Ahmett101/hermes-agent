@@ -46,9 +46,13 @@ from utils import atomic_write_text, is_truthy_value
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
     extract_skill_description,
+    extract_skill_triggers,
     is_skill_description_truncated_for_prompt,
     parse_frontmatter as _parse_frontmatter,
     SKILL_PROMPT_DESC_LIMIT,
+    SKILL_PROMPT_TRIGGERS_LIMIT,
+    SKILL_TRIGGER_MAX_COUNT,
+    SKILL_TRIGGER_MAX_LENGTH,
 )
 
 logger = logging.getLogger(__name__)
@@ -646,6 +650,30 @@ def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[
             f"longer descriptions to {SKILL_PROMPT_DESC_LIMIT - 3} chars + '...', "
             f"destroying the routing signal. Move detail into the skill body."
         )
+
+    raw_triggers = parsed.get("triggers")
+    if raw_triggers is not None:
+        if isinstance(raw_triggers, dict):
+            groups = list(raw_triggers.values())
+        elif isinstance(raw_triggers, list):
+            groups = [raw_triggers]
+        else:
+            return "Frontmatter 'triggers' must be a list or a language-to-list mapping."
+        if any(not isinstance(group, list) for group in groups):
+            return "Each 'triggers' language entry must be a list of strings."
+        values = [value for group in groups for value in group]
+        if not values or any(not isinstance(value, str) or not value.strip() for value in values):
+            return "Frontmatter 'triggers' entries must be non-empty strings."
+        if len(values) > SKILL_TRIGGER_MAX_COUNT:
+            return f"Frontmatter 'triggers' exceeds {SKILL_TRIGGER_MAX_COUNT} entries."
+        if any(len(" ".join(value.split())) > SKILL_TRIGGER_MAX_LENGTH for value in values):
+            return f"Each trigger must be at most {SKILL_TRIGGER_MAX_LENGTH} characters."
+        normalized = extract_skill_triggers(parsed)
+        if len(normalized) != len(values):
+            return "Frontmatter 'triggers' contains duplicates or exceeds the prompt budget."
+        rendered = ", ".join(normalized)
+        if len(rendered) > SKILL_PROMPT_TRIGGERS_LIMIT:
+            return f"Frontmatter 'triggers' exceeds {SKILL_PROMPT_TRIGGERS_LIMIT} prompt characters."
 
     body = content[end_match.end() + 3:].strip()
     if not body:

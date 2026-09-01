@@ -1180,6 +1180,9 @@ def resolve_skill_config_values(
 # ── Description extraction ────────────────────────────────────────────────
 
 SKILL_PROMPT_DESC_LIMIT = 60
+SKILL_PROMPT_TRIGGERS_LIMIT = 240
+SKILL_TRIGGER_MAX_LENGTH = 80
+SKILL_TRIGGER_MAX_COUNT = 24
 
 
 def _normalize_skill_description(frontmatter: Dict[str, Any]) -> str:
@@ -1202,6 +1205,39 @@ def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bo
     """True when the description will be truncated in the system prompt skill index."""
     desc = _normalize_skill_description(frontmatter)
     return len(desc) > SKILL_PROMPT_DESC_LIMIT
+
+
+def extract_skill_triggers(frontmatter: Dict[str, Any]) -> List[str]:
+    """Normalize optional multilingual trigger aliases for the skill index.
+
+    ``triggers`` may be a flat list or a mapping of language codes to lists.
+    Invalid values are ignored so hand-authored third-party skills cannot break
+    discovery. The bounded result keeps one skill from inflating every request's
+    system prompt; ``skill_manage`` validates the same public limits on writes.
+    """
+    raw = frontmatter.get("triggers")
+    groups = raw.values() if isinstance(raw, dict) else (raw,)
+    result: List[str] = []
+    seen: Set[str] = set()
+    used = 0
+    for group in groups:
+        values = group if isinstance(group, (list, tuple)) else (group,)
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            trigger = " ".join(value.split())
+            if not trigger or len(trigger) > SKILL_TRIGGER_MAX_LENGTH:
+                continue
+            folded = trigger.casefold()
+            if folded in seen:
+                continue
+            added = len(trigger) + (2 if result else 0)
+            if len(result) >= SKILL_TRIGGER_MAX_COUNT or used + added > SKILL_PROMPT_TRIGGERS_LIMIT:
+                return result
+            result.append(trigger)
+            seen.add(folded)
+            used += added
+    return result
 
 
 # ── File iteration ────────────────────────────────────────────────────────

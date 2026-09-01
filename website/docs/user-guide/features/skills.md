@@ -166,6 +166,9 @@ name: my-skill
 description: Brief description of what this skill does
 version: 1.0.0
 platforms: [macos, linux]     # Optional — restrict to specific OS platforms
+triggers:                       # Optional — multilingual discovery aliases
+  en: [storyboard, shot breakdown]
+  zh: [分鏡, 鏡頭分解]
 metadata:
   hermes:
     tags: [python, automation]
@@ -194,6 +197,29 @@ Trigger conditions for this skill.
 ## Verification
 How to confirm it worked.
 ```
+
+### Multilingual discovery triggers
+
+The optional `triggers` field adds short aliases to the static skill index the
+model scans before choosing `skill_view`. Use either a flat list or a mapping
+from language code to lists of strings:
+
+```yaml
+triggers: [storyboard, shot breakdown]
+
+# Or group aliases by language for maintainability:
+triggers:
+  en: [storyboard, shot breakdown]
+  zh: [分鏡, 鏡頭分解]
+  ja: [ストーリーボード, カット分け]
+```
+
+Descriptions remain the human-readable summary returned by `skills_list()`;
+triggers are discovery aliases shown only in the model's skill index. They are
+case-insensitive routing hints, so do not repeat the same alias with different
+capitalization. A skill may declare up to 24 aliases, each at most 80
+characters, with at most 240 rendered characters in total. Skills without
+`triggers` behave exactly as before.
 
 ### Platform-Specific Skills
 

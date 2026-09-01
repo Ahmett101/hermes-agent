@@ -31,6 +31,7 @@ from agent.skill_utils import (
     SKILL_SUPPORT_DIRS,
     extract_skill_conditions,
     extract_skill_description,
+    extract_skill_triggers,
     get_all_skills_dirs,
     get_disabled_skill_names,
     iter_skill_index_files,
@@ -1511,9 +1512,9 @@ def drain_truncation_warnings() -> list:
 _SKILLS_PROMPT_CACHE_MAX = 32
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
-# v2: entries gained org provenance fields (org_id/org_author/rel_dir) for M2
-# org-shared skills; older snapshots are discarded and rebuilt.
-_SKILLS_SNAPSHOT_VERSION = 2
+# v3: entries gained multilingual trigger aliases; older snapshots are
+# discarded so the static skill index never serves description-only metadata.
+_SKILLS_SNAPSHOT_VERSION = 3
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1647,6 +1648,7 @@ def _build_snapshot_entry(
         "category": category,
         "frontmatter_name": str(frontmatter.get("name", skill_name)),
         "description": description,
+        "triggers": extract_skill_triggers(frontmatter),
         "platforms": [str(p).strip() for p in platforms if str(p).strip()],
         "conditions": extract_skill_conditions(frontmatter),
     }
@@ -1666,6 +1668,16 @@ def _build_snapshot_entry(
         except Exception:
             entry["org_author"] = ""
     return entry
+
+
+def _skill_index_description(entry: dict) -> str:
+    """Combine prose and bounded trigger aliases for model-side discovery."""
+    description = str(entry.get("description") or "").strip()
+    triggers = [str(value) for value in (entry.get("triggers") or []) if str(value)]
+    if not triggers:
+        return description
+    aliases = f"[triggers: {', '.join(triggers)}]"
+    return f"{description} {aliases}".strip()
 
 
 # =========================================================================
@@ -1939,7 +1951,10 @@ def _build_skills_system_prompt_inner(
                         continue
                     project_names.add(fm_name)
                     skills_by_category.setdefault(entry["category"], []).append(
-                        (fm_name, f"[project] {entry['description']}".strip())
+                        (
+                            fm_name,
+                            f"[project] {_skill_index_description(entry)}".strip(),
+                        )
                     )
                 except Exception as e:
                     logger.debug("Error reading project skill %s: %s", skill_file, e)
@@ -1969,7 +1984,7 @@ def _build_skills_system_prompt_inner(
         name_owners.setdefault(fm, set()).add(kind)
     for entry in visible_entries:
         fm = entry.get("frontmatter_name") or entry.get("skill_name") or ""
-        desc = entry.get("description", "")
+        desc = _skill_index_description(entry)
         org_id = entry.get("org_id")
         collided = len(name_owners.get(fm, set())) > 1
         if org_id:
@@ -2039,7 +2054,7 @@ def _build_skills_system_prompt_inner(
                     continue
                 seen_skill_names.add(frontmatter_name)
                 skills_by_category.setdefault(entry["category"], []).append(
-                    (frontmatter_name, entry["description"])
+                    (frontmatter_name, _skill_index_description(entry))
                 )
             except Exception as e:
                 logger.debug("Error reading external skill %s: %s", skill_file, e)

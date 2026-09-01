@@ -317,6 +317,32 @@ class TestBuildSkillsSystemPrompt:
         # "search" should appear only once per category
         assert result.count("- search") == 1
 
+    def test_multilingual_triggers_survive_cold_scan_and_snapshot(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "creative" / "storyboard"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: storyboard\n"
+            "description: Plan visual scenes.\n"
+            "triggers:\n"
+            "  en: [storyboard, shot breakdown]\n"
+            "  zh: [分鏡, 鏡頭分解]\n"
+            "---\n\n# Storyboard\n",
+            encoding="utf-8",
+        )
+
+        cold = build_skills_system_prompt()
+        assert "[triggers: storyboard, shot breakdown, 分鏡, 鏡頭分解]" in cold
+
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+
+        clear_skills_system_prompt_cache(clear_snapshot=False)
+        warm = build_skills_system_prompt()
+        assert warm == cold
+
 
     def test_compact_categories_demote_nested_and_miss_cache_separately(
         self, monkeypatch, tmp_path

@@ -117,6 +117,33 @@ class TestValidateFrontmatter:
         content = "---\n: invalid: yaml: {{{\n---\n\nBody.\n"
         assert "YAML frontmatter parse error" in _validate_frontmatter(content)
 
+    def test_accepts_multilingual_trigger_mapping(self):
+        content = VALID_SKILL_CONTENT.replace(
+            "description: A test skill for unit testing.\n",
+            "description: A test skill for unit testing.\n"
+            "triggers:\n"
+            "  en: [storyboard, shot breakdown]\n"
+            "  zh: [分鏡, 鏡頭分解]\n",
+        )
+
+        assert _validate_frontmatter(content, new_skill=True) is None
+
+    @pytest.mark.parametrize(
+        "triggers, expected",
+        [
+            ("storyboard", "must be a list or a language-to-list mapping"),
+            ("{en: storyboard}", "language entry must be a list"),
+            ("[storyboard, STORYBOARD]", "contains duplicates"),
+        ],
+    )
+    def test_rejects_invalid_triggers(self, triggers, expected):
+        content = VALID_SKILL_CONTENT.replace(
+            "description: A test skill for unit testing.\n",
+            f"description: A test skill for unit testing.\ntriggers: {triggers}\n",
+        )
+
+        assert expected in _validate_frontmatter(content, new_skill=True)
+
 
 # ---------------------------------------------------------------------------
 # _validate_file_path — path traversal prevention
