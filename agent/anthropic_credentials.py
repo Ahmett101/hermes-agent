@@ -81,7 +81,6 @@ def _is_oauth_token(key: str) -> bool:
     return False
 
 
-
 class CredentialPersistError(RuntimeError):
     """A rotated single-use credential could not be durably committed.
 
@@ -200,7 +199,8 @@ def _append_spent_rotation_sidecar(source_path: Path, fingerprints: list) -> Non
         os.replace(tmp, sidecar)
     except Exception:
         logger.debug(
-            "Failed to persist spent-rotation fingerprints to %s", sidecar,
+            "Failed to persist spent-rotation fingerprints to %s",
+            sidecar,
             exc_info=True,
         )
 
@@ -280,11 +280,17 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
     try:
         # Read the "Claude Code-credentials" generic password entry
         result = subprocess.run(
-            ["security", "find-generic-password",
-             "-s", "Claude Code-credentials",
-             "-w"],
+            [
+                "security",
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ],
             capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
             stdin=subprocess.DEVNULL,
         )
@@ -415,7 +421,9 @@ def is_claude_code_token_valid(creds: Dict[str, Any]) -> bool:
     return now_ms < (expires_at - 60_000)
 
 
-def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) -> Dict[str, Any]:
+def refresh_anthropic_oauth_pure(
+    refresh_token: str, *, use_json: bool = False
+) -> Dict[str, Any]:
     """Refresh an Anthropic OAuth token without mutating local credential files."""
     import time
     import urllib.parse
@@ -500,7 +508,11 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     # Without this direct resolver path, two profiles can still spend one
     # single-use refresh token even though CredentialPool is serialized.
     try:
-        from hermes_cli.auth import AUTH_LOCK_TIMEOUT_SECONDS, _auth_store_lock, env_float
+        from hermes_cli.auth import (
+            AUTH_LOCK_TIMEOUT_SECONDS,
+            _auth_store_lock,
+            env_float,
+        )
 
         refresh_timeout_seconds = env_float(
             "HERMES_ANTHROPIC_REFRESH_TIMEOUT_SECONDS", 20
@@ -530,9 +542,8 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
                     logger.debug("Adopted Claude Code's already-refreshed OAuth token")
                     return current_token
 
-            refresh_token = (
-                (current or {}).get("refreshToken", "")
-                or creds.get("refreshToken", "")
+            refresh_token = (current or {}).get("refreshToken", "") or creds.get(
+                "refreshToken", ""
             )
             if not refresh_token:
                 logger.debug("No refresh token available — cannot refresh")
@@ -678,7 +689,9 @@ def _write_claude_code_credentials(
         raise CredentialPersistError(cred_path, e) from e
 
 
-def _resolve_claude_code_token_from_credentials(creds: Optional[Dict[str, Any]] = None) -> Optional[str]:
+def _resolve_claude_code_token_from_credentials(
+    creds: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
     """Resolve a token from Claude Code credential files, refreshing if needed."""
     creds = creds or read_claude_code_credentials()
     if creds and is_rotation_consumed_uncommitted(
@@ -700,11 +713,15 @@ def _resolve_claude_code_token_from_credentials(creds: Optional[Dict[str, Any]] 
         refreshed = _refresh_oauth_token(creds)
         if refreshed:
             return refreshed
-        logger.debug("Token refresh failed — re-run 'claude setup-token' to reauthenticate")
+        logger.debug(
+            "Token refresh failed — re-run 'claude setup-token' to reauthenticate"
+        )
     return None
 
 
-def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[str, Any]]) -> Optional[str]:
+def _prefer_refreshable_claude_code_token(
+    env_token: str, creds: Optional[Dict[str, Any]]
+) -> Optional[str]:
     """Prefer Claude Code creds when a persisted env OAuth token would shadow refresh.
 
     Hermes historically persisted setup tokens into ANTHROPIC_TOKEN. That makes
@@ -726,14 +743,16 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
     return None
 
 
-def _resolve_anthropic_pool_token() -> Optional[str]:
+def _resolve_anthropic_pool_token(*, refresh_expired: bool = False) -> Optional[str]:
     """Return the first available Anthropic OAuth token from credential_pool.
 
-    Read-only: enumerates with ``clear_expired=False, refresh=False`` so a bare
-    token *resolve* (which runs from diagnostic/read-only call sites such as
-    ``account_usage`` and ``hermes models``) never mutates ``~/.hermes/auth.json``
-    or makes a network refresh call. Refresh-on-expiry is owned by the API call
-    path's pool recovery, not the resolver.
+    By default this is read-only: it enumerates with ``clear_expired=False,
+    refresh=False`` so diagnostic/read-only call sites can inspect the pool
+    without mutating ``auth.json`` or making a network refresh call.
+
+    Runtime startup passes ``refresh_expired=True`` because an expired
+    pool-owned OAuth row can still be recoverable via its refresh token, and
+    agent init happens before the API-call path's pool recovery can run.
     """
     try:
         from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
@@ -742,6 +761,12 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
 
     try:
         pool = load_pool("anthropic")
+        if refresh_expired:
+            selected = pool.select()
+            if getattr(selected, "auth_type", None) != AUTH_TYPE_OAUTH:
+                return None
+            token = (getattr(selected, "access_token", None) or "").strip()
+            return token or None
         # Enumerate read-only (clear_expired=False, refresh=False): never persist
         # to auth.json or trigger a network refresh from a bare resolve. select()
         # is deliberately NOT used — it runs clear_expired=True, refresh=True,
@@ -837,7 +862,7 @@ def resolve_anthropic_token() -> Optional[str]:
         return resolved_claude_token
 
     # 5. Hermes credential_pool OAuth entry.
-    resolved_pool_token = _resolve_anthropic_pool_token()
+    resolved_pool_token = _resolve_anthropic_pool_token(refresh_expired=True)
     if resolved_pool_token:
         return resolved_pool_token
 
@@ -913,6 +938,8 @@ _OAUTH_TOKEN_URL = _OAUTH_TOKEN_URLS[0]
 _OAUTH_TOKEN_USER_AGENT = "axios/1.7.9"
 _OAUTH_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
 _OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
+
+
 def _get_hermes_oauth_file() -> Path:
     return get_hermes_home() / ".anthropic_oauth.json"
 
@@ -924,9 +951,12 @@ def _generate_pkce() -> tuple:
     import secrets
 
     verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
-    challenge = base64.urlsafe_b64encode(
-        hashlib.sha256(verifier.encode()).digest()
-    ).rstrip(b"=").decode()
+    challenge = (
+        base64
+        .urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .rstrip(b"=")
+        .decode()
+    )
     return verifier, challenge
 
 
@@ -1037,8 +1067,10 @@ def run_hermes_oauth_login_pure() -> Optional[Dict[str, Any]]:
                 continue
 
         if result is None:
-            raise last_error if last_error is not None else ValueError(
-                "Anthropic token exchange failed"
+            raise (
+                last_error
+                if last_error is not None
+                else ValueError("Anthropic token exchange failed")
             )
     except Exception as e:
         print(f"Token exchange failed: {e}")
@@ -1098,7 +1130,9 @@ def _write_hermes_oauth_credentials(
             "expiresAt": expires_at_ms,
         }
         oauth_file.parent.mkdir(parents=True, exist_ok=True)
-        _tmp_oauth = oauth_file.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
+        _tmp_oauth = oauth_file.with_suffix(
+            f".tmp.{os.getpid()}.{secrets.token_hex(4)}"
+        )
         try:
             fd = os.open(
                 str(_tmp_oauth),
@@ -1118,7 +1152,8 @@ def _write_hermes_oauth_credentials(
             raise
     except (OSError, IOError, ValueError) as e:
         logger.error(
-            "Failed to write refreshed Hermes OAuth credentials to %s: %s", oauth_file, e
+            "Failed to write refreshed Hermes OAuth credentials to %s: %s",
+            oauth_file,
+            e,
         )
         raise CredentialPersistError(oauth_file, e) from e
-
