@@ -5999,7 +5999,21 @@ def _wait_for_launchd_service_pid(
         time.sleep(0.5)
 
 
+def _cleanup_stale_dashboard_backends_for_gateway_restart() -> None:
+    """Best-effort reap of stale dashboard/serve backends before gateway restart."""
+    try:
+        from hermes_cli.dashboard_procs import _kill_stale_dashboard_processes
+
+        _kill_stale_dashboard_processes(
+            reason="the gateway is restarting to load current code",
+            restart_managed=True,
+        )
+    except Exception:
+        logger.debug("Failed to clean stale dashboard backends", exc_info=True)
+
+
 def launchd_restart():
+    _cleanup_stale_dashboard_backends_for_gateway_restart()
     label = get_launchd_label()
     domain = _launchd_domain()
     target = f"{domain}/{label}"
