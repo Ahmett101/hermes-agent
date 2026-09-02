@@ -6013,7 +6013,8 @@ def _cleanup_stale_dashboard_backends_for_gateway_restart() -> None:
 
 
 def launchd_restart():
-    _cleanup_stale_dashboard_backends_for_gateway_restart()
+    if sys.platform == "darwin":
+        _cleanup_stale_dashboard_backends_for_gateway_restart()
     label = get_launchd_label()
     domain = _launchd_domain()
     target = f"{domain}/{label}"
