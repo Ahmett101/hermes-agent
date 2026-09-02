@@ -329,11 +329,10 @@ def test_client_passes_custom_base_url_to_sdk(monkeypatch):
     ("base_url", "expected_url"),
     [
         ("https://api.supermemory.ai", "https://api.supermemory.ai/v4/conversations"),
-        ("http://localhost:6767", "http://localhost:6767/v4/conversations"),
     ],
 )
 def test_ingest_conversation_uses_client_base_url(monkeypatch, base_url, expected_url):
-    """Raw conversation ingest follows the same endpoint as SDK operations."""
+    """Cloud conversation ingest keeps using the platform conversation endpoint."""
     from plugins.memory.supermemory import _SupermemoryClient
 
     client = _SupermemoryClient.__new__(_SupermemoryClient)
@@ -358,6 +357,53 @@ def test_ingest_conversation_uses_client_base_url(monkeypatch, base_url, expecte
     monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     client.ingest_conversation("s1", [{"role": "user", "content": "hello there"}])
     assert captured["url"] == expected_url
+
+
+def test_ingest_conversation_self_hosted_uses_documents_api(monkeypatch):
+    """Self-hosted servers do not expose /v4/conversations, so ingest via /v3 documents."""
+    from plugins.memory.supermemory import _SupermemoryClient
+
+    client = _SupermemoryClient.__new__(_SupermemoryClient)
+    client._api_key = "test-key"
+    client._container_tag = "hermes"
+    client._timeout = 1.0
+    client._base_url = "http://localhost:6767"
+
+    captured = {}
+
+    class FakeDocuments:
+        def add(self, **kwargs):
+            captured.update(kwargs)
+            return object()
+
+    class FakeSdkClient:
+        documents = FakeDocuments()
+
+    def fail_urlopen(*args, **kwargs):
+        raise AssertionError("self-hosted ingest must not call /v4/conversations")
+
+    monkeypatch.setattr("urllib.request.urlopen", fail_urlopen)
+    client._client = FakeSdkClient()
+
+    client.ingest_conversation(
+        "s1",
+        [
+            {"role": "user", "content": "hello there"},
+            {"role": "assistant", "content": "hi back"},
+        ],
+        metadata={"platform": "cli"},
+    )
+
+    assert captured["content"] == "User: hello there\n\nAssistant: hi back"
+    assert captured["container_tags"] == ["hermes"]
+    assert captured["custom_id"] == "session-s1"
+    assert captured["metadata"] == {
+        "sm_source": "hermes",
+        "type": "full_session",
+        "session_id": "s1",
+        "message_count": 2,
+        "platform": "cli",
+    }
 
 
 # -- Multi-container tests ----------------------------------------------------

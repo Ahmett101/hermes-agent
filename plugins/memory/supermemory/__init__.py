@@ -395,7 +395,41 @@ class _SupermemoryClient:
         preview = (target.get("memory") or "")[:100]
         return {"success": True, "message": f'Forgot: "{preview}"', "id": memory_id}
 
+    def _is_self_hosted(self) -> bool:
+        return self._base_url != _DEFAULT_BASE_URL
+
+    def _conversation_document_content(self, messages: list[dict]) -> str:
+        lines = []
+        for message in messages:
+            role = str(message.get("role") or "message").strip() or "message"
+            content = str(message.get("content") or "").strip()
+            if not content:
+                continue
+            lines.append(f"{role.title()}: {content}")
+        return "\n\n".join(lines)
+
+    def _ingest_conversation_document(self, session_id: str, messages: list[dict], metadata: dict | None) -> None:
+        content = self._conversation_document_content(messages)
+        if not content:
+            return
+        kwargs: dict[str, Any] = {
+            "content": content,
+            "container_tags": [self._container_tag],
+            "custom_id": f"session-{session_id}",
+            "metadata": self._merge_metadata({
+                "type": "full_session",
+                "session_id": session_id,
+                "message_count": len(messages),
+                **(metadata or {}),
+            }),
+        }
+        self._client.documents.add(**kwargs)
+
     def ingest_conversation(self, session_id: str, messages: list[dict], metadata: dict | None = None) -> None:
+        if self._is_self_hosted():
+            self._ingest_conversation_document(session_id, messages, metadata)
+            return
+
         payload: dict = {
             "conversationId": session_id,
             "messages": messages,
