@@ -47,3 +47,52 @@ def test_import_missing_file_returns_1(tmp_path, monkeypatch, capsys):
     rc = sc.cmd_sessions(_args("import", path=str(tmp_path / "nope.jsonl")))
     assert rc == 1
     assert "file not found" in capsys.readouterr().out.lower()
+
+
+def test_stats_opens_state_db_read_only(tmp_path, monkeypatch, capsys):
+    """Read-only stats must not open a transient writer that can reset a live WAL generation."""
+    opened_read_only = []
+
+    class FakeSessionDB:
+        db_path = tmp_path / "state.db"
+
+        def __init__(self, read_only=False):
+            opened_read_only.append(read_only)
+
+        def session_count(self, source=None):
+            return 0
+
+        def message_count(self):
+            return 0
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermes_state.SessionDB", FakeSessionDB)
+
+    rc = sc.cmd_sessions(_args("stats"))
+
+    assert rc is None
+    assert opened_read_only == [True]
+    assert "Total sessions: 0" in capsys.readouterr().out
+
+
+def test_mutating_session_commands_still_open_writer(tmp_path, monkeypatch):
+    opened_read_only = []
+
+    class FakeSessionDB:
+        db_path = tmp_path / "state.db"
+
+        def __init__(self, read_only=False):
+            opened_read_only.append(read_only)
+
+        def resolve_session_id(self, session_id):
+            return None
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("hermes_state.SessionDB", FakeSessionDB)
+
+    assert sc.cmd_sessions(_args("delete", session_id="missing")) == 1
+    assert opened_read_only == [False]
