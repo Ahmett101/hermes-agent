@@ -462,11 +462,43 @@ def is_google_installed_app_secret(finding: Finding, line: str) -> bool:
     return finding.pattern_id == "hardcoded_secret" and bool(_GOOGLE_PUBLIC_CLIENT_SECRET.search(line))
 
 
+# A sandbox may replace its private namespace's identity database with a synthetic file. In
+# bubblewrap the sensitive path is the second operand of a bind option; Docker/Podman spell the
+# same relationship as the destination half of ``-v`` or ``target=``. This is not host-file
+# access, but keep it reviewable (high) and reject the demotion if the line also reads/copies the
+# host path. Every occurrence must be a recognised destination so a source operand cannot hide.
+_SYSTEM_IDENTITY_PATH = r"/etc/(?:passwd|shadow)"
+_SANDBOX_MOUNT_TARGETS = (
+    re.compile(
+        rf'["\']?--(?:ro-)?bind(?:-try)?["\']?\s*,\s*[^,]+,\s*["\']?(?P<target>{_SYSTEM_IDENTITY_PATH})'
+    ),
+    re.compile(rf'--(?:ro-)?bind(?:-try)?\s+\S+\s+(?P<target>{_SYSTEM_IDENTITY_PATH})(?=\s|$)'),
+    re.compile(rf'(?:-v|--volume)\s+[^\s:]+:(?P<target>{_SYSTEM_IDENTITY_PATH})(?::[^\s]+)?'),
+    re.compile(
+        rf'--mount\s+[^\n;&]*?\b(?:target|dst|destination)\s*=\s*(?P<target>{_SYSTEM_IDENTITY_PATH})'
+    ),
+)
+_HOST_IDENTITY_ACTION = re.compile(
+    r'\b(?:cat|less|more|head|tail|cp|mv|rm|scp|rsync|curl|wget|tee|chmod|chown|install|eval|exec'
+    r'|popen|check_output|copyfile|copy2|sendfile)\b|\.(?:read|write|open|unlink|copy|append)\w*\s*\('
+    r'|\bopen\s*\(|readFileSync|writeFileSync|appendFileSync|>>', re.IGNORECASE
+)
+
+
+def is_sandbox_mount_target(finding: Finding, line: str) -> bool:
+    """Whether every password-file hit is a sandbox mount destination, not host-file access."""
+    if finding.pattern_id != "system_passwd_access" or _HOST_IDENTITY_ACTION.search(line):
+        return False
+    path_hits = [m.span() for m in re.finditer(_SYSTEM_IDENTITY_PATH, line)]
+    target_hits = [m.span("target") for rx in _SANDBOX_MOUNT_TARGETS for m in rx.finditer(line)]
+    return bool(path_hits) and all(hit in target_hits for hit in path_hits)
+
+
 __all__ = [
     "STEP_DOWN", "DOC_PROSE_EXTENSIONS", "TEST_TREE_DIRS", "LITERAL_INERT_PATTERN_IDS",
     "is_doc_prose", "is_ci_workflow", "is_agent_facing", "prose_cap", "is_self_uninstall_doc", "is_test_tree",
     "is_inert_fixture_line", "is_base64_media",
     "is_regex_alternation_token", "is_data_decode", "is_loopback_only", "is_pip_install_in_prose_literal",
     "is_hex_in_char_class", "logical_line", "is_loopback_continuation", "is_json_prose_value", "is_coin_name_only",
-    "is_google_installed_app_secret",
+    "is_google_installed_app_secret", "is_sandbox_mount_target",
 ]

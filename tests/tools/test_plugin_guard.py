@@ -867,6 +867,36 @@ class TestIntakeFalsePositiveRound3:
         sevs = {f.severity for f in result.findings if f.pattern_id == pattern_id}
         assert sevs == {severity}, format_scan_report(result)
 
+    @pytest.mark.parametrize("line", [
+        'identity_binds = ["--ro-bind", str(identity / "passwd"), "/etc/passwd"]\n',
+        'args = ["--bind-try", source, "/etc/shadow"]\n',
+        "bwrap --ro-bind synthetic-passwd /etc/passwd --ro-bind /usr /usr\n",
+        "docker run -v synthetic-passwd:/etc/passwd:ro image\n",
+        "podman run --mount type=bind,source=synthetic-passwd,target=/etc/passwd,readonly image\n",
+    ])
+    def test_sandbox_identity_mount_target_is_reviewable_caution(self, tmp_path, line):
+        files = dict(BASE_FILES)
+        files["contained.py"] = line
+        result = scan_plugin(_mk_plugin(tmp_path, files), source="owner/repo")
+        passwd = [f for f in result.findings if f.pattern_id == "system_passwd_access"]
+        assert [(f.severity, f.file) for f in passwd] == [("high", "contained.py")]
+        assert result.verdict == "caution"
+        assert should_allow_plugin_install(result, force=True)[0] is True
+
+    @pytest.mark.parametrize("line", [
+        'args = ["--ro-bind", "/etc/passwd", "/sandbox/passwd"]\n',
+        'identity_binds = ["--ro-bind", open("/etc/passwd"), "/etc/passwd"]\n',
+        "cat /etc/passwd | bwrap --ro-bind synthetic-passwd /etc/passwd\n",
+        "cp /etc/passwd synthetic-passwd && docker run -v synthetic-passwd:/etc/passwd:ro image\n",
+    ])
+    def test_host_password_access_beside_mount_shape_stays_dangerous(self, tmp_path, line):
+        files = dict(BASE_FILES)
+        files["contained.py"] = line
+        result = scan_plugin(_mk_plugin(tmp_path, files), source="owner/repo")
+        passwd = [f for f in result.findings if f.pattern_id == "system_passwd_access"]
+        assert passwd and any(f.severity == "critical" for f in passwd), format_scan_report(result)
+        assert result.verdict == "dangerous"
+
     def test_google_installed_app_client_secret_is_caution_not_dangerous(self, tmp_path):
         """A ``GOCSPX-`` literal is a Google installed-app OAuth client secret, which ships in every
         copy of the app: reviewable caution. Any other secret-shaped literal still hard-blocks."""

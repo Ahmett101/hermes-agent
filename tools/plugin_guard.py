@@ -20,12 +20,12 @@ from tools.plugin_guard_context import (
     is_doc_prose, is_google_installed_app_secret, is_hex_in_char_class, is_inert_fixture_line,
     is_json_prose_value, is_locale_catalog,
     is_loopback_continuation, is_loopback_only, is_pip_install_in_prose_literal, is_regex_alternation_token,
-    is_self_uninstall_doc, is_test_tree, logical_line, prose_cap)
+    is_sandbox_mount_target, is_self_uninstall_doc, is_test_tree, logical_line, prose_cap)
 from tools.skills_guard import (
     Finding, ScanResult, SUSPICIOUS_BINARY_EXTENSIONS, _determine_verdict, format_scan_report,
     scan_file)
 
-PLUGIN_SCANNER_VERSION = "plugin-guard-v9"
+PLUGIN_SCANNER_VERSION = "plugin-guard-v10"
 
 # Never scanned: VCS internals, caches, vendored envs.
 EXCLUDED_DIRS = {
@@ -251,6 +251,8 @@ def _context_severity(f: Finding, rel_path: str, line: str, joined: str, doc_pro
         sev = _at_most(sev, "medium")    # "monero gateway" in a connector index, no miner on the line
     if is_google_installed_app_secret(f, line):
         sev = _at_most(sev, "high")    # public installed-app OAuth client secret, reviewable caution
+    if is_sandbox_mount_target(f, line):
+        sev = _at_most(sev, "high")    # synthetic identity DB mounted over the sandbox path
     if is_code and is_pip_install_in_prose_literal(f, line):
         sev = "low"    # "no pip install is needed" in a user-facing message
     return sev
