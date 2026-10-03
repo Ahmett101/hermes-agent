@@ -372,6 +372,53 @@ class TestExecutionScopedInterruption:
         assert result is True
         mock_mark.assert_called_once()
 
+    def test_landed_delivery_wins_over_late_interrupted_flag(self):
+        """If shutdown/drain accounting arrives after delivery landed, the
+        receipt is the terminal checkpoint; the bookkeeping tail must not
+        rewrite the delivered run as interrupted."""
+        import cron.scheduler as sched
+
+        token = object()
+        job = {
+            "id": "job-delivered",
+            "name": "delivered",
+            "prompt": "do work",
+            "deliver": "bot-chat",
+            "fire_claim": {"by": "owner-delivered"},
+            "execution_id": "exec-1",
+        }
+
+        def _deliver_then_interrupt(*_args, **_kwargs):
+            sched._interrupted_job_ids.add(token)
+            return None
+
+        with patch("cron.scheduler.claim_dispatch", return_value=True), \
+             patch("cron.scheduler.mark_execution_running", return_value={"id": "exec-1"}), \
+             patch("agent.secret_scope.set_secret_scope", return_value=None), \
+             patch("agent.secret_scope.build_profile_secret_scope", return_value=None), \
+             patch("agent.secret_scope.reset_secret_scope"), \
+             patch("tools.terminal_scope.install_profile_terminal_scope", return_value=None), \
+             patch("cron.scheduler.run_job", return_value=(True, "full output", "final response", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._is_cron_silence_response", return_value=False), \
+             patch("cron.scheduler._deliver_result", side_effect=_deliver_then_interrupt), \
+             patch("cron.scheduler.fire_claim_fence"), \
+             patch("cron.scheduler.heartbeat_fire_claim", return_value=True), \
+             patch("cron.scheduler.mark_job_run", return_value=True) as mock_mark, \
+             patch("cron.scheduler.finish_execution") as mock_finish:
+            result = sched._run_one_job_body(job, execution_token=token)
+
+        assert result is True
+        mock_mark.assert_called_once()
+        assert mock_mark.call_args.args[:3] == ("job-delivered", True, None)
+        assert mock_mark.call_args.kwargs["expected_fire_owner"] == "owner-delivered"
+        assert mock_finish.call_args.kwargs == {
+            "success": True,
+            "error": None,
+            "delivery_outcome": "delivered",
+        }
+        assert sched._is_interrupted("job-delivered", token) is False
+
 
 class TestCombinedCancelEvent:
     def test_or_semantics(self):

@@ -2893,7 +2893,11 @@ def run_one_job(
                     _running_fire_owners.pop(_fire_key, None)
 
 
-_OWNERSHIP_LOST_INTERRUPTED = "Interrupted by shutdown before terminal completion."
+_OWNERSHIP_LOST_INTERRUPTED = "Interrupted before terminal completion."
+_INTERRUPTED_DURING_RUN_ERROR = (
+    "Interrupted by gateway shutdown before the run finished "
+    "(tool subprocess was killed mid-flight)."
+)
 
 
 def _record_fire_ownership_lost(job_id: str, fire_owner: Optional[str], execution_id: str) -> None:
@@ -3078,10 +3082,7 @@ def _save_compose_deliver(
     # output; force the honest "interrupted" failure path. Peek-only (consumed later).
     if d.success and _is_interrupted(job["id"], execution_token):
         d.success = False
-        d.error = (
-            "Interrupted by gateway shutdown before the run finished "
-            "(tool subprocess was killed mid-flight)."
-        )
+        d.error = _INTERRUPTED_DURING_RUN_ERROR
 
     (
         deliver_content, d.blocked_config, _silent_alert, d.incident_acked, d.failure_incident_id,
@@ -3157,7 +3158,7 @@ def _finish_interrupted_run(job: dict, execution_id: str, delivery_error: Option
                 "Failed recording delivery_error for interrupted job %s: %s", job["id"], _rec_err)
     finish_execution(
         execution_id, success=False,
-        error="Interrupted by gateway shutdown before terminal completion.")
+        error="Interrupted before terminal completion.")
 
 
 def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_id: str) -> bool:
@@ -3444,6 +3445,16 @@ def _run_one_job_body(
                 return True
 
         if _consume_interrupted_flag(job["id"], execution_token):
+            if (
+                d.delivery_attempted
+                and not d.delivery_error
+                and d.error != _INTERRUPTED_DURING_RUN_ERROR
+            ):
+                logger.warning(
+                    "Job '%s': interrupted after delivery completed; "
+                    "recording the delivered run's terminal status",
+                    job["id"])
+                return _finish_completed_run(d, fire_owner, execution_id)
             _finish_interrupted_run(job, execution_id, delivery_error)
             return True
 
