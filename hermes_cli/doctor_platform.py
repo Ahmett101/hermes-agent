@@ -3,12 +3,15 @@ Split out of ``hermes_cli/doctor.py``, which re-exports every name so ``hermes_c
 
 from __future__ import annotations
 
+import importlib
 import os
 import shutil
 import ssl
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from hermes_cli.colors import Colors, color
 from hermes_cli.config import is_nix_install_method, recommended_update_command_for_method
 from hermes_cli.doctor_report import (
@@ -427,6 +430,21 @@ def _staged_venv_dir() -> "Path | None":
     return None
 
 
+def _probe_python_crypto(
+    import_module: Callable[[str], Any] = importlib.import_module,
+) -> str | None:
+    """Return why the running Python lacks native password-derivation support."""
+    try:
+        import_module("_hashlib")
+    except ImportError as exc:
+        return f"_hashlib could not be imported: {exc}"
+    hashlib = import_module("hashlib")
+    missing = [name for name in ("pbkdf2_hmac", "scrypt") if not hasattr(hashlib, name)]
+    if missing:
+        return "hashlib is missing " + " and ".join(missing)
+    return None
+
+
 @doctor_check()
 def _check_python_environment(should_fix: bool, f: Finding) -> None:
     """Interpreter, linked SQLite, venv, macOS TCC anchors/FDA/grants, version-file drift."""
@@ -435,6 +453,18 @@ def _check_python_environment(should_fix: bool, f: Finding) -> None:
         _fail_and_issue(label, "(3.10+ required)", "Upgrade Python to 3.10+", f.issues)
     elif check_bool(v >= (3, 10), label, (label, "(3.10+ recommended)")) and v < (3, 11):
         check_warn("Python 3.11+ recommended for RL Training tools (tinker requires >= 3.11)")
+    crypto_problem = _probe_python_crypto()
+    if crypto_problem is None:
+        check_ok("Python native crypto (_hashlib, PBKDF2, scrypt)")
+    else:
+        _fail_and_issue(
+            "Python native crypto unavailable",
+            f"({crypto_problem})",
+            f"Repair the Hermes Python runtime: {_python_repair_hint()}. On Windows, if Application Control "
+            "continues to block _hashlib.pyd, keep the security policy enabled and report the Code Integrity "
+            "event to Hermes maintainers.",
+            f.issues,
+        )
     # Linked SQLite: version + source id matter independently of the Python minor (uv's
     # python-build-standalone can keep a vulnerable SQLite across upgrades).
     with warn_on_error("SQLite version probe failed: {e}", ""):
