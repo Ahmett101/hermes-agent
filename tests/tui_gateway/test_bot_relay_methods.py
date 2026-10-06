@@ -140,8 +140,15 @@ def test_deliver_validates_profile_and_runs_transport(home, monkeypatch):
     assert argv[0].rsplit("\\", 1)[-1].rsplit("/", 1)[-1] in ("hermes", "hermes.exe")
     assert "Bot Chat" in argv and "--query-file" in argv
 
+    # Desktop profile routing may rewrite the legacy ``profile`` field to the
+    # representative socket owner. The explicit relay target must win.
+    _result(srv._methods["bot_relay.deliver"](
+        2, {"profile": "default", "target_profile": "ops", "message": "x"}
+    ))
+    assert calls["argv"][1:3] == ["-p", "ops"]
+
     # 'hermes' alias resolves to default
-    _result(srv._methods["bot_relay.deliver"](2, {"profile": "hermes", "message": "x"}))
+    _result(srv._methods["bot_relay.deliver"](3, {"profile": "hermes", "message": "x"}))
     assert calls["argv"][1:3] == ["-p", "default"]
 
     # unknown profile refuses without spawning; so does a bare infra dir under profiles/ (#99392)

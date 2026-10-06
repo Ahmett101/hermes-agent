@@ -850,7 +850,7 @@ describe('the drain loop wires drain → deliver → reply', () => {
 
     expect(calls.find(call => call.method === 'bot_relay.deliver')).toMatchObject({
       connectionId: 'b',
-      params: { message: 'status?', profile: 'ops' }
+      params: { message: 'status?', profile: 'ops', target_profile: 'ops' }
     })
 
     // #93911: the deliver deadline must outlive the backend's own turn bound.

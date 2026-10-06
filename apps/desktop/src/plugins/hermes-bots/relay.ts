@@ -660,6 +660,7 @@ async function deliverRelayEnvelope(
       'bot_relay.deliver',
       {
         profile: String(envelope?.target_profile || ''),
+        target_profile: String(envelope?.target_profile || ''),
         message: String(envelope?.message || ''),
         from_profile: String(envelope?.from_profile || ''),
         from_handle: String(envelope?.from_handle || ''),

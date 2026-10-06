@@ -90,11 +90,12 @@ def _(rid, params: dict, _root=_relay_root) -> dict:
 @method("bot_relay.deliver")
 def _(rid, params: dict, _root=_relay_root, _run=_run_delivery,
       _failure_reason=delivery_failure_reason) -> dict:
-    """Deliver a relayed DM (``profile``, attribution-prefixed ``message``) into a Bot Chat ON THIS
-    GATEWAY via the one-turn ``hermes -p <profile> chat -c "Bot Chat"`` transport local DMs use →
-    ``{reply}``. Blocking by design (Desktop relay worker; the RPC pool keeps it off the reader)."""
+    """Deliver a relayed DM (``target_profile`` or legacy ``profile``, attribution-prefixed
+    ``message``) into a Bot Chat ON THIS GATEWAY via the one-turn
+    ``hermes -p <profile> chat -c "Bot Chat"`` transport local DMs use → ``{reply}``. Blocking by
+    design (Desktop relay worker; the RPC pool keeps it off the reader)."""
     import tempfile
-    profile = str(params.get("profile") or "").strip()
+    profile = str(params.get("target_profile") or params.get("profile") or "").strip()
     message = str(params.get("message") or "").strip()
     if not profile or not message:
         return _err(rid, 4090, "profile and message required")
